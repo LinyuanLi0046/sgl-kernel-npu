@@ -508,25 +508,26 @@ class AlltoAllNormalCommStrategy(NormalEPCommStrategy):
 
         num_tokens_per_expert = num_global_tokens_per_local_expert.sum(axis=0)
 
-        expert_ids_per_ep_rank = (
-            torch.arange(
-                num_experts,
-                dtype=torch.int32,
-                device=device,
+        input_quant = os.getenv("DEEP_NORMAL_MODE_USE_INT8_QUANT") == "1"
+        if num_local_experts > 1 and input_quant:
+            # The INT8 path still uses token_permute for both activations and
+            # per-token scales.  Keep its explicit per-route expert ids until
+            # npu_moe_re_routing(per_token_scales=...) is validated here.
+            expert_ids_per_ep_rank = (
+                torch.arange(
+                    num_experts,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                % num_local_experts
             )
-            % num_local_experts
-        )
-
-        num_global_tokens_per_local_expert_ravel = (
-            num_global_tokens_per_local_expert.ravel()
-        )
-        if num_local_experts > 1:
             global_tokens_indices = torch.repeat_interleave(
                 expert_ids_per_ep_rank,
-                num_global_tokens_per_local_expert_ravel,
+                num_global_tokens_per_local_expert.ravel(),
             )
         else:
-            torch.npu.synchronize()
+            if num_local_experts <= 1:
+                torch.npu.synchronize()
             global_tokens_indices = None
 
         self._alltoall_layout = {
@@ -535,6 +536,7 @@ class AlltoAllNormalCommStrategy(NormalEPCommStrategy):
             "output_splits": output_splits,
             "num_global_tokens_per_local_expert": num_global_tokens_per_local_expert,
             "global_tokens_indices": global_tokens_indices,
+            "input_quant": input_quant,
         }
 
         num_tokens_per_rank = num_local_tokens_per_expert.reshape(
@@ -587,6 +589,7 @@ class AlltoAllNormalCommStrategy(NormalEPCommStrategy):
             "num_global_tokens_per_local_expert"
         ]
         global_tokens_indices = layout["global_tokens_indices"]
+        input_quant = layout["input_quant"]
 
         hidden_shape = x.shape
         x = x.view(-1, hidden_shape[-1])
@@ -597,7 +600,6 @@ class AlltoAllNormalCommStrategy(NormalEPCommStrategy):
             num_out_tokens=topk_idx.numel(),
         )
 
-        input_quant = os.getenv("DEEP_NORMAL_MODE_USE_INT8_QUANT") == "1"
         if input_quant:
             permutated_tokens, dynamic_scale = torch_npu.npu_dynamic_quant(
                 permutated_tokens
@@ -617,19 +619,39 @@ class AlltoAllNormalCommStrategy(NormalEPCommStrategy):
         handle_a2a.wait()
         permutated_tokens.untyped_storage().resize_(0)
 
-        if num_local_experts > 1:
-            if input_quant:
-                dynamic_scale_after_all2all, _ = torch_npu.npu_moe_token_permute(
-                    dynamic_scale_after_all2all.unsqueeze(-1), global_tokens_indices
-                )
-                dynamic_scale_after_all2all = dynamic_scale_after_all2all.squeeze(-1)
-
+        inverse_rerouting_counts = None
+        reversed_global_mapping = None
+        if num_local_experts > 1 and input_quant:
+            dynamic_scale_after_all2all, _ = torch_npu.npu_moe_token_permute(
+                dynamic_scale_after_all2all.unsqueeze(-1), global_tokens_indices
+            )
+            dynamic_scale_after_all2all = dynamic_scale_after_all2all.squeeze(-1)
             dispatch_out, reversed_global_mapping = torch_npu.npu_moe_token_permute(
                 global_input_tokens, global_tokens_indices
             )
+        elif num_local_experts > 1 and global_input_tokens.shape[0] > 0:
+            # all_to_all_single produces source-rank-major rows, while grouped
+            # matmul requires rows for each local expert to be contiguous.
+            # ReRouting performs this regular [source, expert] ->
+            # [expert, source] transpose directly from the compact count
+            # matrix, avoiding a second generic InitRouting and the
+            # per-route global_tokens_indices tensor.
+            rerouting_counts = num_global_tokens_per_local_expert.to(
+                dtype=torch.int64
+            ).contiguous()
+            dispatch_out, _, _, _ = torch_npu.npu_moe_re_routing(
+                global_input_tokens,
+                rerouting_counts,
+                per_token_scales=None,
+            )
+            # ReRouting is a ragged block transpose.  Applying it again with
+            # the transposed count matrix restores [expert, source] rows to
+            # the [source, expert] layout required by the reverse all-to-all.
+            inverse_rerouting_counts = rerouting_counts.transpose(
+                0, 1
+            ).contiguous()
         else:
             dispatch_out = global_input_tokens
-            reversed_global_mapping = None
 
         num_recv_tokens_per_expert_list = (
             num_global_tokens_per_local_expert.sum(axis=0).cpu().numpy().tolist()
@@ -641,6 +663,7 @@ class AlltoAllNormalCommStrategy(NormalEPCommStrategy):
             "topk_weights": topk_weights,
             "reversed_local_mapping": reversed_local_mapping,
             "reversed_global_mapping": reversed_global_mapping,
+            "inverse_rerouting_counts": inverse_rerouting_counts,
             "hidden_shape": hidden_shape,
             "hidden_shape_before_permute": x.shape,
             "num_local_experts": num_local_experts,
@@ -678,16 +701,25 @@ class AlltoAllNormalCommStrategy(NormalEPCommStrategy):
         topk_weights = handle["topk_weights"]
         reversed_local_mapping = handle["reversed_local_mapping"]
         reversed_global_mapping = handle["reversed_global_mapping"]
+        inverse_rerouting_counts = handle["inverse_rerouting_counts"]
         hidden_shape = handle["hidden_shape"]
         hidden_shape_before_permute = handle["hidden_shape_before_permute"]
         num_local_experts = handle["num_local_experts"]
 
-        if (
-            x.shape[0] > 0
-            and num_local_experts > 1
-            and reversed_global_mapping is not None
-        ):
-            x = torch_npu.npu_moe_token_unpermute(x, reversed_global_mapping)
+        if x.shape[0] > 0 and num_local_experts > 1:
+            if inverse_rerouting_counts is not None:
+                # Invert the dispatch-side ragged block transpose without
+                # materializing or sorting a per-route row mapping.
+                x, _, _, _ = torch_npu.npu_moe_re_routing(
+                    x,
+                    inverse_rerouting_counts,
+                    per_token_scales=None,
+                )
+            elif reversed_global_mapping is not None:
+                # INT8 fallback: preserve the existing activation/scale
+                # permutation contract until ReRouting scale support is
+                # validated end-to-end.
+                x = torch_npu.npu_moe_token_unpermute(x, reversed_global_mapping)
 
         _, local_tokens, a2a_handle = self._async_all_to_all(
             x,

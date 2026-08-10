@@ -89,12 +89,6 @@ class HCCLDispatcher:
             local_expert_indices_offset + i for i in range(self.num_local_experts)
         ]
 
-        self.expert_ids_per_ep_rank = torch.tensor(
-            [i % self.num_local_experts for i in range(self.num_experts)],
-            dtype=torch.int32,
-            device="npu",
-        )
-
     def dispatch(self, hidden_states, topk_ids, topk_weights):
         self.hidden_shape = hidden_states.shape
         self.topk_weights = topk_weights
@@ -143,21 +137,26 @@ class HCCLDispatcher:
         )
         handle.wait()
 
-        # 4. Post-process (Re-permute for local experts)
-        self.global_tokens_indices = torch.repeat_interleave(
-            self.expert_ids_per_ep_rank,
-            self.num_global_tokens_per_local_expert.ravel().to(torch.int32),
+        # 4. Post-process source-major A2A output into expert-major GMM input.
+        rerouting_counts = self.num_global_tokens_per_local_expert.to(
+            torch.int64
+        ).contiguous()
+        dispatch_out, _, _, _ = torch_npu.npu_moe_re_routing(
+            global_input_tokens,
+            rerouting_counts,
+            per_token_scales=None,
         )
-
-        dispatch_out, self.reversed_global_mapping = torch_npu.npu_moe_token_permute(
-            global_input_tokens, self.global_tokens_indices
-        )
+        self.inverse_rerouting_counts = rerouting_counts.transpose(
+            0, 1
+        ).contiguous()
         return dispatch_out
 
     def combine(self, hidden_states):
-        # 1. Unpermute locally
-        hidden_states = torch_npu.npu_moe_token_unpermute(
-            hidden_states, self.reversed_global_mapping
+        # 1. Restore expert-major GMM output to source-major A2A layout.
+        hidden_states, _, _, _ = torch_npu.npu_moe_re_routing(
+            hidden_states,
+            self.inverse_rerouting_counts,
+            per_token_scales=None,
         )
 
         # 2. AllToAllV back
