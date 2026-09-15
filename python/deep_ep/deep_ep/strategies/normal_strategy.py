@@ -854,7 +854,8 @@ class AllGatherNormalCommStrategy(NormalEPCommStrategy):
     """
     Normal mode strategy using AllGather implementation.
     All ranks gather all tokens, each rank processes only its local experts,
-    then all-reduce combines partial results.
+    then reduce-scatter combines partial results and restores local rows.
+    Non-local routes rely on Regbase token_unpermute skipping -1 row indices.
     """
 
     def __init__(self, runtime, group: dist.ProcessGroup):
@@ -877,10 +878,13 @@ class AllGatherNormalCommStrategy(NormalEPCommStrategy):
         async_finish: bool = False,
         allocate_on_comm_stream: bool = False,
     ) -> Tuple[
-        torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor, EventOverlap
+        torch.Tensor,
+        Optional[torch.Tensor],
+        torch.Tensor,
+        Optional[torch.Tensor],
+        EventOverlap,
     ]:
         """Get dispatch layout for AllGather mode."""
-        group = self.group
         group_size = self.group_size
         num_local_experts = num_experts // group_size
         ep_rank = self.rank
@@ -894,18 +898,18 @@ class AllGatherNormalCommStrategy(NormalEPCommStrategy):
         }
 
         num_tokens_per_rank = torch.empty(group_size, dtype=torch.int32, device=device)
-        is_token_in_rank = torch.ones(
-            (topk_idx.size(0), group_size), dtype=torch.bool, device=device
-        )
         num_tokens_per_expert = torch.empty(
             num_local_experts, dtype=torch.int64, device=device
         )
 
+        # WeLM's AllGather dispatch does not consume a token/rank membership
+        # matrix: every rank receives every token. Keep the tuple slot without
+        # allocating and filling an unused all-true tensor.
         return (
             num_tokens_per_rank,
             None,
             num_tokens_per_expert,
-            is_token_in_rank,
+            None,
             EventOverlap(),
         )
 
@@ -938,7 +942,6 @@ class AllGatherNormalCommStrategy(NormalEPCommStrategy):
         """Dispatch using AllGather: all ranks get all tokens, process local experts only."""
         layout = self._allgather_layout
         num_experts = layout["num_experts"]
-        num_local_experts = layout["num_local_experts"]
         first_expert_idx = layout["first_expert_idx"]
         last_expert_idx = layout["last_expert_idx"]
         group_size = self.group_size
@@ -979,23 +982,10 @@ class AllGatherNormalCommStrategy(NormalEPCommStrategy):
 
         restore_shape = global_hidden_states.shape
 
-        # Step 2: Mask out non-local expert weights so that after unpermute,
-        # only local expert contributions remain on each rank.
-        if group_size > 1:
-            expert_map = torch.full(
-                (num_experts,), -1, dtype=torch.int32, device=topk_idx.device
-            )
-            expert_map[first_expert_idx:last_expert_idx] = torch.arange(
-                num_local_experts, dtype=torch.int32, device=topk_idx.device
-            )
-            mask = expert_map[global_topk_idx] != -1
-            masked_topk_weights = global_topk_weights * mask.to(
-                global_topk_weights.dtype
-            )
-        else:
-            masked_topk_weights = global_topk_weights
-
-        # Step 3: Local routing — sort tokens by expert, keep only local expert tokens.
+        # Step 2: Local routing — sort tokens by expert, keep only local expert tokens.
+        # InitRouting marks non-local routes with -1 row indices. Regbase
+        # token_unpermute skips them without requiring zero probabilities,
+        # so the original gathered weights can be retained for combine.
         # Pass scale= so init_routing reorders both tokens and scale together.
         topk_idx_int = global_topk_idx.to(torch.int32)
         init_routing_kwargs = dict(
@@ -1025,7 +1015,7 @@ class AllGatherNormalCommStrategy(NormalEPCommStrategy):
 
         combine_handle = {
             "expanded_row_idx": expanded_row_idx,
-            "topk_weights": masked_topk_weights,
+            "topk_weights": global_topk_weights,
             "restore_shape": restore_shape,
             "hidden_shape": hidden_shape,
             "local_num_tokens": local_num_tokens,
