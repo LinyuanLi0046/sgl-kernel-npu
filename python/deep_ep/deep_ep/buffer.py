@@ -108,7 +108,7 @@ class Buffer:
         )
 
     def _init_low_latency_strategy(
-        self, strategy: Union[str, NormalStrategy], comm_alg: str = "hierarchy"
+        self, strategy: Union[str, LowLatencyStrategy], comm_alg: Optional[str] = None
     ):
         """Initialize low latency mode communication strategy"""
         if isinstance(strategy, LowLatencyStrategy):

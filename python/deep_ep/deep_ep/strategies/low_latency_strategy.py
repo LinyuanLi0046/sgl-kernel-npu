@@ -179,13 +179,15 @@ class DefaultLowLatencyCommStrategy(LowLatencyEPCommStrategy):
 
 @register_low_latency_strategy("ops")
 class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
-    """
-    Low latency mode strategy using torch_npu ops.
-    This strategy uses the ops-transformer op for A3 RoCE.
-    """
+    """Low-latency dispatch and combine using torch_npu MC2 V2 ops."""
 
-    def __init__(self, runtime, group: dist.ProcessGroup, comm_alg: str = "hierarchy"):
+    def __init__(self, runtime, group: dist.ProcessGroup, comm_alg: Optional[str] = None):
         super().__init__(group)
+        is_950dt = torch_npu.npu.get_device_name().startswith("Ascend950DT")
+        # On 950DT, CANN 9.1 MTE uses fullmesh_v1 dispatch and default combine.
+        self._use_950dt_mte = is_950dt and comm_alg in (None, "", "fullmesh_v1")
+        if comm_alg is None:
+            comm_alg = "fullmesh_v1" if is_950dt else "hierarchy"
         comm_alg_support_list = ["hierarchy", "fullmesh_v1", "fullmesh_v2", "ccu", ""]
         torch._check(
             comm_alg in comm_alg_support_list,
@@ -250,13 +252,11 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
             device=topk_ids.device,
         )
         topk_padding = torch.cat((topk_ids, topk_padding), dim=0)
-        weight_padding = torch.empty(
-            padding_size,
-            topk_weights.size(1),
-            dtype=topk_weights.dtype,
-            device=topk_weights.device,
-        )
-        weight_padding = torch.cat((topk_weights, weight_padding), dim=0)
+        # MTE applies the source rank's route weights at combine time.
+        weight_padding = None
+        if not self._use_950dt_mte:
+            weight_padding = topk_weights.new_empty((padding_size, topk_weights.size(1)))
+            weight_padding = torch.cat((topk_weights, weight_padding), dim=0)
 
         (
             packed_recv_x,
@@ -283,7 +283,7 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
             x.size(1),
             num_experts,
             packed_recv_count,
-            expand_scales,
+            None if self._use_950dt_mte else expand_scales,
             x_active_mask,
             topk_padding,
             weight_padding,
@@ -327,6 +327,12 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
             weight_padding,
         ) = handle
 
+        if self._use_950dt_mte:
+            weight_padding = topk_weights
+            if src_num < num_max_dispatch_tokens_per_rank:
+                weight_padding = torch.nn.functional.pad(
+                    topk_weights, (0, 0, 0, num_max_dispatch_tokens_per_rank - src_num)
+                )
         combined_x = self._npu_low_latency_combine(
             x=x,
             topk_idx=topk_padding,
@@ -334,7 +340,7 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
             assist_info_for_combine=src_info,
             ep_send_counts=layout_range,
             num_experts=num_experts,
-            comm_alg=self.comm_alg,
+            comm_alg="" if self._use_950dt_mte else self.comm_alg,
             expand_scales=expand_scales,
             x_active_mask=x_active_mask,
             num_max_dispatch_tokens_per_rank=num_max_dispatch_tokens_per_rank,
