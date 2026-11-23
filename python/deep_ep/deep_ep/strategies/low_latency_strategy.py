@@ -196,6 +196,26 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
             ),
         )
         self.comm_alg = comm_alg
+        self._active_mask_templates = {}
+
+    def prepare_low_latency_mask(self, capacity: int, device=None) -> torch.Tensor:
+        """Prebuild an immutable prefix mask template, normally before capture."""
+        device = (
+            torch.device("npu", torch.npu.current_device())
+            if device is None
+            else torch.device(device)
+        )
+        key = (capacity, device)
+        template = self._active_mask_templates.get(key)
+        if template is None:
+            # Every N <= C uses a contiguous C-element view of [True*C, False*C].
+            # Never rewrite this storage: dispatch handles and captured graphs
+            # with different N may still reference it at combine time.
+            template = torch.empty(2 * capacity, dtype=torch.bool, device=device)
+            template[:capacity].fill_(True)
+            template[capacity:].zero_()
+            self._active_mask_templates[key] = template
+        return template
 
     def get_name(self) -> str:
         return "ops"
@@ -227,36 +247,47 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
     ]:
 
         topk_ids = topk_idx.int()
-        x_active_mask = torch.zeros(
-            num_max_dispatch_tokens_per_rank,
-            dtype=torch.bool,
-            device=x.device,
-        )
-        x_active_mask[: x.size(0)] = True
         padding_size = num_max_dispatch_tokens_per_rank - x.size(0)
+        if padding_size < 0:
+            raise ValueError("Input rows exceed the ops low-latency dispatch capacity")
         if self.comm_alg == "hierarchy":
             assert (
                 topk_weights is not None
             ), "When comm_alg='hierarchy', topk_weights can not be None"
-        x_padding = torch.empty(
-            padding_size,
-            x.size(1),
-            dtype=x.dtype,
-            device=x.device,
-        )
-        x_padding = torch.cat((x, x_padding), dim=0)
-        topk_padding = torch.empty(
-            padding_size,
-            topk_ids.size(1),
-            dtype=topk_ids.dtype,
-            device=topk_ids.device,
-        )
-        topk_padding = torch.cat((topk_ids, topk_padding), dim=0)
         # MTE applies the source rank's route weights at combine time.
-        weight_padding = None
-        if not self._use_950dt_mte:
-            weight_padding = topk_weights.new_empty((padding_size, topk_weights.size(1)))
-            weight_padding = torch.cat((topk_weights, weight_padding), dim=0)
+        weight_padding = None if self._use_950dt_mte else topk_weights
+        if padding_size == 0:
+            x_padding = x.contiguous()
+            topk_padding = topk_ids.contiguous()
+            if weight_padding is not None:
+                weight_padding = weight_padding.contiguous()
+            x_active_mask = None  # MC2 treats an absent mask as all rows active.
+        else:
+            template = self.prepare_low_latency_mask(
+                num_max_dispatch_tokens_per_rank, x.device
+            )
+            x_active_mask = template.narrow(
+                0, padding_size, num_max_dispatch_tokens_per_rank
+            )
+            x_padding = torch.empty(
+                padding_size,
+                x.size(1),
+                dtype=x.dtype,
+                device=x.device,
+            )
+            x_padding = torch.cat((x, x_padding), dim=0)
+            topk_padding = torch.empty(
+                padding_size,
+                topk_ids.size(1),
+                dtype=topk_ids.dtype,
+                device=topk_ids.device,
+            )
+            topk_padding = torch.cat((topk_ids, topk_padding), dim=0)
+            if not self._use_950dt_mte:
+                weight_padding = topk_weights.new_empty(
+                    (padding_size, topk_weights.size(1))
+                )
+                weight_padding = torch.cat((topk_weights, weight_padding), dim=0)
 
         (
             packed_recv_x,
