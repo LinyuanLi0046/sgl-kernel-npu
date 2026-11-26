@@ -59,18 +59,20 @@ Outputs PackNpu(const at::Tensor &x, const at::Tensor &ids, const at::Tensor &we
     const uint32_t routeCores = cap > 64 ? 2 : 1;
     const uint32_t hiddenTiles = cap * welm_pack::HIDDEN_WORDS / welm_pack::TILE_WORDS;
     const uint32_t hiddenCores = std::min(availableCores - routeCores, hiddenTiles);
+    const uint32_t hiddenBaseTiles = hiddenTiles / hiddenCores;
     const uint32_t blockDim = hiddenCores + routeCores;
     uint64_t ubBytes = 0;
     platform->GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubBytes);
     const uint32_t maxHiddenBytes =
         (hiddenTiles + hiddenCores - 1) / hiddenCores * welm_pack::TILE_WORDS * sizeof(uint32_t);
-    TORCH_CHECK(maxHiddenBytes <= ubBytes && 2 * cap * welm_pack::TOPK * sizeof(uint32_t) <= ubBytes,
+    TORCH_CHECK(maxHiddenBytes <= ubBytes &&
+                    2 * welm_pack::ROUTE_BUFFER_WORDS * sizeof(uint32_t) <= ubBytes,
                 "welm_pack_decode_inputs: insufficient UB for the device's AIV core count");
     // All tiling attributes are scalar launch arguments. No tiling tensor,
     // H2D copy, workspace memset, device query of input values, or collective.
     EXEC_KERNEL_CMD(welm_pack_decode_inputs_kernel, blockDim,
                     x, ids, weights, std::get<0>(outputs), std::get<1>(outputs), std::get<2>(outputs),
-                    rows, cap, hiddenCores, routeCores);
+                    rows, cap, hiddenCores, hiddenBaseTiles);
     return outputs;
 }
 }  // namespace

@@ -47,6 +47,22 @@ the capacity tail in UB, with no padding input allocation or extra GM reads.
 Non-aligned routing reads explicitly pad to 32 bytes with zero; DMA's default
 dummy fill is not assumed to be zero.
 
+The small-kernel path uses directly constructed `LocalTensor`s, fixed UB
+addresses and fixed event IDs, without `TPipe`/`TBuf` initialization or dynamic
+event allocation. `InitSocState()` still initializes the hardware state. Input
+DMA fills the valid prefix and its 32-byte alignment padding; `Duplicate` fills
+only the disjoint remaining tail. Both routing arrays are submitted before
+waiting on their producers, then both outputs are stored. Ordinary kernels end
+with `PipeBarrier<PIPE_ALL>()`; SK entries drain MTE3 locally without PIPE_ALL.
+
+The host precomputes the hidden tiles-per-core quotient. The device recovers
+the remainder with multiply/subtract; routing divides only by the constant 2
+when needed. The partition and number of launch arguments are unchanged.
+Each route array has a fixed 640-word UB region (5 KiB for both arrays). For
+`C=8` and at least 17 available AIVs, the launch uses 16 hidden cores with 2 KiB
+each and one routing core. `N=4` copies eight hidden chunks and zeroes eight;
+`N=6` copies twelve and zeroes four. No inter-core synchronization is needed.
+
 Tiling uses scalar launch arguments only: there is no tiling H2D, workspace
 initialization, host/device synchronization, `.item()`, sorting or collective.
 The host uses the repository's `EXEC_KERNEL_CMD` queue-aware launch helper.
@@ -61,8 +77,8 @@ by the installed CANN:
 bash build.sh -a kernels YOUR_CANN_SOC_VERSION
 ```
 
-The default builds the ordinary direct-launch entry, preserving compatibility
-with older toolchains. To also emit the explicit SuperKernel entries:
+The default builds the ordinary direct-launch entry without requiring the
+SuperKernel compiler features. To also emit the explicit SuperKernel entries:
 
 ```bash
 SGL_WELM_PACK_SUPERKERNEL=ON bash build.sh -a kernels YOUR_CANN_SOC_VERSION
@@ -73,19 +89,25 @@ environment used for the comparison. The build script packages the wheel but
 does not install it. The comparison reports the imported package path.
 
 This is a **build-time** option. The compiler/devkit must provide `__sk__`,
-`SK_BIND`, `sk::SkSystemArgs` and `TPipe::DestroyWithoutPipeAll`. Unsupported
+`SK_BIND` and `sk::SkSystemArgs`. Unsupported
 toolchains fail compilation rather than silently claiming SuperKernel support.
 The SK entry uses the framework-provided block index and the original partition
 stored in scalar arguments; it does not repartition data using the enclosing
 SK's core count. Both entries share the same packing body. No early-start or
 cache-maintenance-disabling flags are requested.
 
+The packing kernel has its own Ascend C build target with
+`--cce-auto-sync=off`, because its dependencies are handled explicitly. This
+setting does not apply to other operators in the wheel. Both ordinary and SK
+builds require the static-LocalTensor APIs, including `InitSocState()`.
+
 The ordinary and SK builds have not been compiled or executed on an NPU in the
 Windows development workspace. API presence in Python alone does not establish
 that the server's compiler supports these device-side features.
 
 References: [direct-launch SuperKernel adaptation](https://asc.gitcode.com/guide/programming_guide/advanced_programming/super_kernel/kernel_direct_call_adaptation.html),
-[SK_BIND](https://asc.gitcode.com/api/Utils-API/SuperKernel/SK_BIND.html).
+[SK_BIND](https://asc.gitcode.com/api/Utils-API/SuperKernel/SK_BIND.html),
+[static Tensor programming](https://asc.gitcode.com/guide/programming_guide/programming_model/ai_core_simd_programming/cpp_tensor_programming/static_tensor_programming.html).
 
 ## Correctness and latency comparison
 
@@ -94,6 +116,9 @@ Triton-Ascend version used by the current implementation:
 
 ```bash
 python tests/python/sgl_kernel_npu/bench_welm_pack_decode_inputs.py --json pack_graph.json
+# Deployed max-tokens-per-rank=8; same graph timing method:
+python tests/python/sgl_kernel_npu/bench_welm_pack_decode_inputs.py --capacity 8 --rows 4 --json pack_c8_n4.json
+python tests/python/sgl_kernel_npu/bench_welm_pack_decode_inputs.py --capacity 8 --rows 6 --json pack_c8_n6.json
 python tests/python/sgl_kernel_npu/bench_welm_pack_decode_inputs.py --mode static --json pack_static.json
 # Requires a wheel built with SGL_WELM_PACK_SUPERKERNEL=ON:
 python tests/python/sgl_kernel_npu/bench_welm_pack_decode_inputs.py --mode superkernel --json pack_sk.json
@@ -127,3 +152,15 @@ Inspect that a single packing call produces one packing kernel (or participates
 in the expected SK), and compare matched device-task durations with the original
 2-us observation. The standalone comparison does not establish full-MoE latency
 or communication overlap. No sub-2-us result is claimed before device measurement.
+
+The previous implementation was reported on the server at 5.x us versus
+Triton's 2.x us for `C=8, N=4/6`, using this script's default **graph** mode and
+`median_us`; a regression was also reported at C=128. Those observations show
+that the previous implementation missed the performance target. The revision
+above removes source-level overheads identified using the small-kernel scalar
+guidance in `cannbot-skills/ops/ascendc-perf-optimize` and
+`ascendc-performance-best-practices`; it has not yet been compiled or timed on
+the server. It does not establish which instruction/pipeline accounted for the
+reported gap. Timing, baseline selection and the acceptance threshold are
+unchanged. In graph replay, host metadata checks and output allocations are
+not repeated and cannot explain that device-side timing gap.

@@ -61,8 +61,12 @@ def assert_pack(inputs, outputs, capacity):
 def check_eager(triton_pack, native_pack, device):
     # C=7 exercises non-32-byte route output sizes. N=0 is a participating
     # empty rank; N==C checks the functional Torch op's fresh-output contract.
+    # C=8 covers the deployed capacity; C=65, N=32/33 straddle the boundary
+    # between route cores, including a two-word read on the second core.
     cases = (
         (0, 128), (1, 128), (4, 128), (4, 7),
+        (0, 8), (1, 8), (2, 8), (4, 8), (6, 8), (8, 8),
+        (32, 65), (33, 65),
         (7, 7), (16, 128), (127, 128), (128, 128),
     )
     for rows, capacity in cases:

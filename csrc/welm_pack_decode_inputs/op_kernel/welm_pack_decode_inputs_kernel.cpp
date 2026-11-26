@@ -15,7 +15,7 @@ struct PackArgs {
     uint32_t rows;
     uint32_t capacity;
     uint32_t hiddenCores;
-    uint32_t routeCores;
+    uint32_t hiddenBaseTiles;
 };
 
 __aicore__ inline uint32_t Min(uint32_t a, uint32_t b)
@@ -29,28 +29,19 @@ __aicore__ inline uint32_t AlignWords(uint32_t n)
 }
 
 template <HardEvent event>
-__aicore__ inline void Fence(TPipe &pipe)
+__aicore__ inline void Fence()
 {
-    const int32_t id = static_cast<int32_t>(pipe.FetchEventID(event));
-    SetFlag<event>(id);
-    WaitFlag<event>(id);
+    // Each event is consumed immediately. No queue or dynamic event allocation;
+    // IDs 6 and 7 are reserved by the Ascend C static-Tensor APIs.
+    SetFlag<event>(EVENT_ID0);
+    WaitFlag<event>(EVENT_ID0);
 }
 
 // The source is read only over the valid prefix. Padding is generated in UB;
 // IDs and FP32 weights are also copied as raw words, preserving every bit.
-__aicore__ inline void CopyPadded(TPipe &pipe, LocalTensor<uint32_t> local,
-                                 GM_ADDR src, GM_ADDR dst, uint32_t offset,
-                                 uint32_t count, uint32_t validTotal)
+__aicore__ inline void PreparePadded(LocalTensor<uint32_t> local, GM_ADDR src,
+                                    uint32_t offset, uint32_t count, uint32_t valid)
 {
-    const uint32_t valid = offset < validTotal ? Min(count, validTotal - offset) : 0;
-    if (valid < count) {
-        Duplicate(local, uint32_t{0}, AlignWords(count));
-        if (valid > 0) {
-            Fence<HardEvent::V_MTE2>(pipe);
-        } else {
-            Fence<HardEvent::V_MTE3>(pipe);
-        }
-    }
     if (valid > 0) {
         GlobalTensor<uint32_t> input;
         input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t *>(src) + offset, valid);
@@ -61,8 +52,29 @@ __aicore__ inline void CopyPadded(TPipe &pipe, LocalTensor<uint32_t> local,
         const DataCopyPadExtParams<uint32_t> padding{
             true, 0, static_cast<uint8_t>(AlignWords(valid) - valid), 0};
         DataCopyPad(local, input, copyIn, padding);
-        Fence<HardEvent::MTE2_MTE3>(pipe);
     }
+    const uint32_t alignedValid = AlignWords(valid);
+    const uint32_t alignedCount = AlignWords(count);
+    if (alignedValid < alignedCount) {
+        // The DMA (including its right padding) and vector fill write disjoint
+        // 32-byte blocks. No V -> MTE2 dependency is needed between them.
+        Duplicate(local[alignedValid], uint32_t{0}, alignedCount - alignedValid);
+    }
+}
+
+__aicore__ inline void WaitPadded(uint32_t count, uint32_t valid)
+{
+    if (valid > 0) {
+        Fence<HardEvent::MTE2_MTE3>();
+    }
+    if (AlignWords(valid) < AlignWords(count)) {
+        Fence<HardEvent::V_MTE3>();
+    }
+}
+
+__aicore__ inline void StorePadded(LocalTensor<uint32_t> local, GM_ADDR dst,
+                                  uint32_t offset, uint32_t count)
+{
     GlobalTensor<uint32_t> output;
     output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t *>(dst) + offset, count);
     const DataCopyExtParams copyOut{1, count * 4U, 0, 0, 0};
@@ -72,46 +84,59 @@ __aicore__ inline void CopyPadded(TPipe &pipe, LocalTensor<uint32_t> local,
 template <bool superKernel>
 __aicore__ inline void RunPack(const PackArgs &args, uint32_t blockIdx)
 {
+    const uint32_t capacity = args.capacity;
+    const uint32_t hiddenCores = args.hiddenCores;
+    const uint32_t routeCores = capacity > 64 ? 2 : 1;
     // Do not use the fused SuperKernel's total block count to partition work:
     // the original partition is encoded in scalar args. Extra blocks are idle.
-    if (blockIdx >= args.hiddenCores + args.routeCores) {
+    if (blockIdx >= hiddenCores + routeCores) {
         return;
     }
-    TPipe pipe;
-    TBuf<TPosition::VECIN> buffer;
-    TBuf<TPosition::VECIN> weightsBuffer;
-    if (blockIdx < args.hiddenCores) {
-        const uint32_t tiles = args.capacity * welm_pack::HIDDEN_WORDS / welm_pack::TILE_WORDS;
-        const uint32_t baseTiles = tiles / args.hiddenCores;
-        const uint32_t extraTiles = tiles % args.hiddenCores;
+    // Static LocalTensor programming requires explicit hardware-state init.
+    // TPipe used to perform it; do not assume the preceding SK left defaults.
+    InitSocState();
+    if (blockIdx < hiddenCores) {
+        const uint32_t tiles = capacity * welm_pack::HIDDEN_WORDS / welm_pack::TILE_WORDS;
+        const uint32_t baseTiles = args.hiddenBaseTiles;
+        const uint32_t extraTiles = tiles - baseTiles * hiddenCores;
         const uint32_t startTile = blockIdx * baseTiles + Min(blockIdx, extraTiles);
+        const uint32_t offset = startTile * welm_pack::TILE_WORDS;
         const uint32_t count = (baseTiles + (blockIdx < extraTiles)) * welm_pack::TILE_WORDS;
-        pipe.InitBuffer(buffer, count * sizeof(uint32_t));
-        CopyPadded(pipe, buffer.Get<uint32_t>(), args.hidden, args.hiddenOut,
-                   startTile * welm_pack::TILE_WORDS, count, args.rows * welm_pack::HIDDEN_WORDS);
+        const uint32_t validTotal = args.rows * welm_pack::HIDDEN_WORDS;
+        const uint32_t valid = offset < validTotal ? Min(count, validTotal - offset) : 0;
+        LocalTensor<uint32_t> local(TPosition::VECIN, 0, count);
+        PreparePadded(local, args.hidden, offset, count, valid);
+        WaitPadded(count, valid);
+        StorePadded(local, args.hiddenOut, offset, count);
     } else {
-        const uint32_t routeCore = blockIdx - args.hiddenCores;
-        const uint32_t total = args.capacity * welm_pack::TOPK;
-        const uint32_t perCore = AlignWords((total + args.routeCores - 1) / args.routeCores);
+        const uint32_t routeCore = blockIdx - hiddenCores;
+        const uint32_t total = capacity * welm_pack::TOPK;
+        const uint32_t perCore = AlignWords(capacity > 64 ? (total + 1) / 2 : total);
         const uint32_t offset = routeCore * perCore;
         const uint32_t count = Min(perCore, total - offset);
-        pipe.InitBuffer(buffer, AlignWords(count) * sizeof(uint32_t));
-        pipe.InitBuffer(weightsBuffer, AlignWords(count) * sizeof(uint32_t));
-        CopyPadded(pipe, buffer.Get<uint32_t>(), args.ids, args.idsOut,
-                   offset, count, args.rows * welm_pack::TOPK);
-        // Separate UB storage allows the preceding MTE3 store to overlap this
-        // input copy/zero-fill; no reuse fence between IDs and weights.
-        CopyPadded(pipe, weightsBuffer.Get<uint32_t>(), args.weights, args.weightsOut,
-                   offset, count, args.rows * welm_pack::TOPK);
+        const uint32_t validTotal = args.rows * welm_pack::TOPK;
+        const uint32_t valid = offset < validTotal ? Min(count, validTotal - offset) : 0;
+        LocalTensor<uint32_t> idsLocal(TPosition::VECIN, 0, welm_pack::ROUTE_BUFFER_WORDS);
+        LocalTensor<uint32_t> weightsLocal(TPosition::VECIN,
+            welm_pack::ROUTE_BUFFER_WORDS * sizeof(uint32_t), welm_pack::ROUTE_BUFFER_WORDS);
+        // Submit both arrays before waiting. Their input copies and zero fills
+        // are independent; one pair of events covers both arrays' producers.
+        PreparePadded(idsLocal, args.ids, offset, count, valid);
+        PreparePadded(weightsLocal, args.weights, offset, count, valid);
+        WaitPadded(count, valid);
+        StorePadded(idsLocal, args.idsOut, offset, count);
+        StorePadded(weightsLocal, args.weightsOut, offset, count);
     }
-    // Drain this core's output DMA before returning to another SK subkernel.
-    // This is a local pipeline fence, not an inter-core/global synchronization.
-    Fence<HardEvent::MTE3_S>(pipe);
-#ifdef SGL_WELM_PACK_SUPERKERNEL
     if constexpr (superKernel) {
-        pipe.DestroyWithoutPipeAll();
+        // All input/zero-fill producers have joined MTE3 above. Drain output
+        // DMA before UB reuse by the next SK. The direct-launch SK contract
+        // omits PIPE_ALL teardown; this fence is local to the current core.
+        Fence<HardEvent::MTE3_S>();
+    } else {
+        // Required at an ordinary static-Tensor kernel's exit. No extra
+        // MTE3_S fence followed by TPipe's implicit PIPE_ALL teardown.
+        PipeBarrier<PIPE_ALL>();
     }
-#endif
 }
 }  // namespace
 
@@ -122,13 +147,13 @@ extern "C" __global__ __aicore__ void welm_pack_decode_inputs_kernel(
 #endif
     GM_ADDR hidden, GM_ADDR ids, GM_ADDR weights,
     GM_ADDR hiddenOut, GM_ADDR idsOut, GM_ADDR weightsOut,
-    uint32_t rows, uint32_t capacity, uint32_t hiddenCores, uint32_t routeCores)
+    uint32_t rows, uint32_t capacity, uint32_t hiddenCores, uint32_t hiddenBaseTiles)
 {
 #ifndef SGL_WELM_PACK_SUPERKERNEL
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
 #endif
     const PackArgs args{hidden, ids, weights, hiddenOut, idsOut, weightsOut,
-                        rows, capacity, hiddenCores, routeCores};
+                        rows, capacity, hiddenCores, hiddenBaseTiles};
     RunPack<false>(args, AscendC::GetBlockIdx());
 }
 

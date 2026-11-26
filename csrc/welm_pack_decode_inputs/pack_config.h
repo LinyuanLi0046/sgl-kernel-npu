@@ -13,6 +13,10 @@ constexpr uint32_t HIDDEN_WORDS = HIDDEN / 2;
 // Same 2048-byte hidden tile as the original Triton's 1024 BF16 elements.
 constexpr uint32_t TILE_WORDS = 512;
 constexpr uint32_t ALIGN_WORDS = 8;  // 32-byte UB alignment
+// One route core for C <= 64, two above that. Each array uses at most 640
+// words per core; fixed, disjoint UB addresses avoid a device allocator.
+constexpr uint32_t ROUTE_BUFFER_WORDS = (MAX_CAPACITY / 2) * TOPK;
+static_assert(ROUTE_BUFFER_WORDS % ALIGN_WORDS == 0);
 }  // namespace welm_pack
 
 #endif
