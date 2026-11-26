@@ -18,10 +18,15 @@ if(SGL_KERNEL_ENABLE_A3_ONLY_OPS)
 endif()
 message(STATUS "SGL_KERNEL_ENABLE_A3_ONLY_OPS=${SGL_KERNEL_ENABLE_A3_ONLY_OPS} (SOC=${SOC_VERSION})")
 
+# Ordinary direct launch remains buildable with older CANN toolchains. Enable
+# this only with a compiler/devkit providing __sk__, SK_BIND and SkSystemArgs.
+option(SGL_WELM_PACK_SUPERKERNEL "Build WeLM decode packing SuperKernel entries" OFF)
+
 # host side files
 set(OP_SRCS
     ${PROJECT_OP_SRC_BASE}/pytorch_extensions.cpp
     ${PROJECT_OP_SRC_BASE}/helloworld/op_host/helloworld.cpp
+    ${PROJECT_OP_SRC_BASE}/welm_pack_decode_inputs/op_host/welm_pack_decode_inputs.cpp
     ${PROJECT_OP_SRC_BASE}/cache_location_assign/op_host/cache_loc_assign.cpp
     ${PROJECT_OP_SRC_BASE}/alloc_extend/op_host/alloc_extend_tiling.cpp
     ${PROJECT_OP_SRC_BASE}/assign_cache_op/op_host/assign_cache.cpp
@@ -77,6 +82,7 @@ endif()
 # kernel side files without workspace
 set(NO_WORKSPACE_KERNEL_SRCS
     ${PROJECT_OP_SRC_BASE}/helloworld/op_kernel/kernel_helloworld.cpp
+    ${PROJECT_OP_SRC_BASE}/welm_pack_decode_inputs/op_kernel/welm_pack_decode_inputs_kernel.cpp
     ${PROJECT_OP_SRC_BASE}/cache_location_assign/op_kernel/cache_loc_assign_kernel.cpp
     ${PROJECT_OP_SRC_BASE}/assign_cache_op/op_kernel/assign_cache_op.cpp
     ${PROJECT_OP_SRC_BASE}/lora/op_kernel/bgmv_expand_kernel.cpp
@@ -104,6 +110,9 @@ if(BUILD_CATLASS_MODULE AND SGL_KERNEL_ENABLE_A3_ONLY_OPS)
 endif()
 
 ascendc_library(no_workspace_kernel STATIC ${NO_WORKSPACE_KERNEL_SRCS})
+if(SGL_WELM_PACK_SUPERKERNEL)
+    ascendc_compile_definitions(no_workspace_kernel PRIVATE -DSGL_WELM_PACK_SUPERKERNEL)
+endif()
 ascendc_include_directories(no_workspace_kernel PRIVATE
     ${PROJECT_OP_SRC_BASE}/utils/kernel
 )
