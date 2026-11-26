@@ -4,7 +4,6 @@
 
 namespace {
 using namespace AscendC;
-namespace Reg = AscendC::MicroAPI;
 
 struct SigmoidMulArgs {
     GM_ADDR gate;
@@ -15,19 +14,23 @@ struct SigmoidMulArgs {
     uint32_t activeCores;
 };
 
-constexpr Reg::CastTrait TO_FLOAT = {
-    Reg::RegLayout::ZERO, Reg::SatMode::UNKNOWN,
-    Reg::MaskMergeMode::ZEROING, RoundMode::UNKNOWN};
-constexpr Reg::CastTrait TO_BFLOAT = {
-    Reg::RegLayout::ZERO, Reg::SatMode::NO_SAT,
-    Reg::MaskMergeMode::ZEROING, RoundMode::CAST_RINT};
-
 // All gate nonlinearities are computed once per tile, before broadcasting.
 // Intermediate sigmoid values stay in registers, including the BF16 rounding.
 __simd_vf__ inline void SigmoidMulVf(
     __ubuf__ bfloat16_t *gate, __ubuf__ bfloat16_t *attention,
     __ubuf__ bfloat16_t *output, uint16_t rows)
 {
+    // CANN 9.1's host-stub pass parses namespace-scope declarations without
+    // exposing MicroAPI. Keep register-only declarations inside the VF body.
+    namespace Reg = AscendC::MicroAPI;
+    // Cast takes its trait by template reference: retain static storage for
+    // these compile-time constants, with no runtime initialization.
+    static constexpr Reg::CastTrait TO_FLOAT = {
+        Reg::RegLayout::ZERO, Reg::SatMode::UNKNOWN,
+        Reg::MaskMergeMode::ZEROING, RoundMode::UNKNOWN};
+    static constexpr Reg::CastTrait TO_BFLOAT = {
+        Reg::RegLayout::ZERO, Reg::SatMode::NO_SAT,
+        Reg::MaskMergeMode::ZEROING, RoundMode::CAST_RINT};
     constexpr uint32_t lanes = VECTOR_REG_WIDTH / sizeof(float);
     static_assert(lanes == welm_sigmoid_mul::MAX_TILE_ROWS);
     uint32_t active = rows;
