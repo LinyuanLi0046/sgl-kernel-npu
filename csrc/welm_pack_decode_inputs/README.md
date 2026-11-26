@@ -192,3 +192,73 @@ cause requires matched runtime evidence. This VF revision leaves the entire
 comparison script unchanged, including those pre-measurement cases. In graph
 replay, host metadata checks and output allocations are not repeated and cannot
 explain the device-side timing gap.
+
+## Collect and package msprof op / simulator evidence
+
+From the Linux server's repository root, with the rebuilt wheel installed and
+the CANN/MindStudio environment sourced:
+
+```bash
+python tests/python/sgl_kernel_npu/collect_welm_pack_profiles.py
+# Optional: use the exact SoC reported by `import acl; acl.get_soc_name()`:
+python tests/python/sgl_kernel_npu/collect_welm_pack_profiles.py --soc-version YOUR_CANN_SOC_VERSION
+# The same row sweep at capacity 128:
+python tests/python/sgl_kernel_npu/collect_welm_pack_profiles.py --capacity 128
+```
+
+Defaults are **rows 1, 2, 4, 6, 8; capacity 8; Ascend C and Triton; both
+`msprof op` and `msprof op simulator`**. This produces 20 separate collection
+jobs, run sequentially. The SoC defaults to `SOC_VERSION`, or is detected using
+`acl.get_soc_name()`. No simulator library is injected into the board environment.
+On 950, the profiler selects its simulator through `--soc-version`, as described
+in the [official simulator guide](https://github.com/Ascend/msopprof/blob/master/docs/en/user_guide/msopprof_simulator_user_guide.md).
+
+Each board job launches three target calls; `msprof op` performs ten internal
+warmups and collects `Default` metrics. Each simulator job launches **one**
+target call, without the benchmark's graph loop or full correctness matrix.
+Both reuse its input generator, bitwise checker and original Triton loader.
+Kernel-name filtering excludes auxiliary operations. Core filtering is omitted
+so that hidden-copy, hidden-zero and routing cores can all be inspected.
+Simulator metrics retain their defaults, including synchronization information.
+See the [official board guide](https://github.com/Ascend/msopprof/blob/master/docs/en/user_guide/msopprof_user_guide.md)
+for metric and warmup definitions.
+
+**At rows=capacity=8, the production Triton wrapper bypasses packing.** This
+collector explicitly launches the same original JIT kernel for that diagnostic
+case, with the same block size and grid, and records `full_capacity_diagnostic`.
+It does not change production behavior. These are individual **eager kernel**
+profiles, not the original NPUGraph `median_us`; simulation time is not hardware
+latency. No static-kernel or SuperKernel mode is enabled by this collector.
+
+Results and an adjacent `.tar.gz` default to `output/welm_pack_profiles_<time>`:
+
+```text
+welm_pack_profiles_<time>/
+  manifest.json                    # configuration, commands, status, artifacts
+  summary.tsv                      # one status row per collection job
+  *_help.log, npu_smi.log           # installed tool capabilities / device info
+  sources/                         # current operator, baseline and scripts
+  board/{ascendc,triton}/rows_*/    # profiler/, run.log, worker.json
+  simulator/{ascendc,triton}/rows_*/
+```
+
+Each `worker.json` records package versions, loaded native library path/SHA256,
+baseline SHA256 and the bitwise check. Triton jobs use private `triton_cache/`
+directories, retained in the archive with their compiler outputs. Native source
+line mapping depends on debug information in the installed wheel; the collector
+does not rebuild it or change compilation flags. All profiler outputs, including
+CSV, traces, binaries and intermediate data actually generated, are packaged.
+
+Useful options: `--stages board` or `--stages simulator`,
+`--implementations ascendc` or `--implementations triton`, `--rows 4 6`,
+`--device 0`, `--output /absolute/new_directory`, `--msprof /path/to/msprof`.
+`--dry-run` generates commands and an archive without importing Torch or running
+profilers. Existing output directories/archives are never overwritten.
+
+Failed/empty captures are marked and the remaining cases continue. Each job has
+a 600-second wall-clock limit (`--timeout`); partial outputs and logs are still
+packed after a failure or Ctrl+C. Exit code **0** means all requested captures
+passed the worker check and produced the expected report files (or a dry run
+completed); **1** means the archive contains incomplete/failed captures.
+The script has only been checked without NPU hardware in the development
+workspace; profiler and simulator execution must be verified on the server.
