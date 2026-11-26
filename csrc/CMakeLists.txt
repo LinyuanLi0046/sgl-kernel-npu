@@ -126,6 +126,13 @@ ascendc_library(welm_pack_decode_kernel STATIC
 ascendc_compile_options(welm_pack_decode_kernel PRIVATE --cce-auto-sync=off)
 if(_sgl_soc_lower MATCHES "^ascend950")
     ascendc_compile_definitions(welm_pack_decode_kernel PRIVATE -DSGL_WELM_PACK_A5)
+    # Packing copies raw uint32 words and fills zeros; it performs no floating-
+    # point arithmetic. Avoid recording numeric overflow status at kernel exit.
+    # Keep this local to packing; arithmetic kernels retain their defaults.
+    ascendc_compile_options(welm_pack_decode_kernel PRIVATE
+        -mllvm
+        -cce-aicore-record-overflow=false
+    )
 endif()
 if(SGL_WELM_PACK_SUPERKERNEL)
     ascendc_compile_definitions(welm_pack_decode_kernel PRIVATE -DSGL_WELM_PACK_SUPERKERNEL)

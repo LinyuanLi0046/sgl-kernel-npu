@@ -101,6 +101,19 @@ The packing kernel has its own Ascend C build target with
 setting does not apply to other operators in the wheel. Both ordinary and SK
 builds require the static-LocalTensor APIs, including `InitSocState()`.
 
+On Ascend 950, this target also passes
+`-mllvm -cce-aicore-record-overflow=false`. Packing uses raw `uint32_t` copies
+and zero stores, with no floating-point arithmetic or conversion, so it does
+not need to record numeric overflow status. Input NaNs and negative zero still
+travel as unchanged bits. This targets the compiler-generated status-recording
+epilogue seen in the profile below; it does not remove `InitSocState()`, DMA
+dependencies, cache maintenance or the final ordinary/SK synchronization.
+The option is confined to this target and applies to all supported rows and
+capacities; other operators and other SoCs keep their existing settings.
+The compiler option is also used in the
+[official direct-launch build examples](https://github.com/Ascend/samples/blob/fc2aea93e48be8f8cee51d0c6c1b13a08155f83a/cplusplus/level1_single_api/4_op_dev/6_ascendc_custom_op/kernel_invocation/Add/CMakeLists.txt).
+Those examples alone do not validate its effect on the server's 950 compiler.
+
 On Ascend 950 builds, tail filling uses an explicit `__simd_vf__` with
 `MicroAPI::Duplicate`, `UpdateMask` and `StoreAlign`. The routing core fills both
 IDs and weights in one VF, sharing the zero register, loop and mask; hidden
@@ -178,17 +191,38 @@ in the expected SK), and compare matched device-task durations with the original
 2-us observation. The standalone comparison does not establish full-MoE latency
 or communication overlap. No sub-2-us result is claimed before device measurement.
 
-The most recent server report before the explicit-VF change is a stable
-3.2 us for Ascend C versus 1.7 us for Triton at `N=4, C=8`, using the default
-**graph** mode's `median_us`. The performance target has not been met. The VF
-revision has not yet been compiled or timed on the server; source analysis
-alone does not attribute the 1.5-us gap to any specific instruction/pipeline.
+The earlier server report was a stable 3.2 us for Ascend C versus 1.7 us for
+Triton at `N=4, C=8`, using the default **graph** mode's `median_us`.
+The subsequent `welm_pack_profiles_20261127_002834` capture measured the VF
+revision (`dfbdcb7`) on `Ascend950DT_9582` with CANN 9.1.0. At `N=4, C=8`,
+the median **eager device-task duration** over three samples was 3.649 us for
+Ascend C and 1.961 us for Triton. These are different timing methods; do not
+compare the graph median directly with the profiler duration.
+
+In that capture, averaging the eight hidden-copy blocks over three samples,
+Scalar time was 2.060 us for Ascend C versus 0.579 us for Triton. MTE2/MTE3
+times were similar and those blocks did not execute VF. Across all collected
+rows (1, 2, 4, 6, 8), each native block also wrote 128 bytes more to main memory.
+The available simulator trace shows native `STATUS` read/modify/write in the
+epilogue. This motivates disabling numeric overflow recording before changing
+the data path further. The simulator logs are incomplete: they cannot establish
+the full epilogue duration or prove that this sequence explains the entire gap.
+Triton also performs cache maintenance at exit.
+
+The overflow-recording change has not yet been compiled or measured on the
+server. Rebuild and install the new wheel, then use the existing graph benchmark
+and row-sweep collector above/below. Check bitwise correctness, graph latency,
+Scalar time and per-block GM traffic against the same baseline. In a new
+instruction trace, verify whether the status-recording sequence disappears;
+if it remains, inspect the actual compiler command and generated binary before
+attributing any timing change to the option. No performance target is claimed
+as met until a matched device rerun confirms it.
 
 The Triton source is identical between revisions `7c81be8` and `2f45a31`.
 Their timing code is also identical, but `2f45a31` added eager correctness cases
 before measurement. Consequently, the earlier reported change from 2.x to
 1.7 us for Triton is not evidence of a Triton code optimization; the exact
-cause requires matched runtime evidence. This VF revision leaves the entire
+cause requires matched runtime evidence. This compiler change leaves the entire
 comparison script unchanged, including those pre-measurement cases. In graph
 replay, host metadata checks and output allocations are not repeated and cannot
 explain the device-side timing gap.
