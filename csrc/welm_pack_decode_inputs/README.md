@@ -93,14 +93,16 @@ Run from the repository root after installing the rebuilt wheel and the same
 Triton-Ascend version used by the current implementation:
 
 ```bash
-python csrc/welm_pack_decode_inputs/bench.py --json pack_graph.json
-python csrc/welm_pack_decode_inputs/bench.py --mode static --json pack_static.json
+python tests/python/sgl_kernel_npu/bench_welm_pack_decode_inputs.py --json pack_graph.json
+python tests/python/sgl_kernel_npu/bench_welm_pack_decode_inputs.py --mode static --json pack_static.json
 # Requires a wheel built with SGL_WELM_PACK_SUPERKERNEL=ON:
-python csrc/welm_pack_decode_inputs/bench.py --mode superkernel --json pack_sk.json
+python tests/python/sgl_kernel_npu/bench_welm_pack_decode_inputs.py --mode superkernel --json pack_sk.json
 ```
 
 The default is **N=4, C=128, H=2048, K=10**, with 512-expert IDs. It imports the
 actual baseline `python/deep_ep/deep_ep/ops_padding.py`, without initializing EP.
+The loader exposes `tl` in that module's globals for Triton versions that do not
+resolve closure variables during JIT compilation; it preserves the kernel source.
 It checks bitwise preservation (including NaNs and negative zero), zero tails,
 empty inputs, non-aligned routing sizes and changing input contents after capture.
 
@@ -117,8 +119,8 @@ exit code 2 means the performance target was not met. Correctness failures raise
 For device-task duration and actual SK coverage, additionally collect:
 
 ```bash
-python csrc/welm_pack_decode_inputs/bench.py --profile-dir pack_profile
-python csrc/welm_pack_decode_inputs/bench.py --mode superkernel --profile-dir pack_sk_profile
+python tests/python/sgl_kernel_npu/bench_welm_pack_decode_inputs.py --profile-dir pack_profile
+python tests/python/sgl_kernel_npu/bench_welm_pack_decode_inputs.py --mode superkernel --profile-dir pack_sk_profile
 ```
 
 Inspect that a single packing call produces one packing kernel (or participates

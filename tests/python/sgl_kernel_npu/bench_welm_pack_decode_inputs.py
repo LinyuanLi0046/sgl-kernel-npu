@@ -17,8 +17,13 @@ import sgl_kernel_npu  # noqa: F401 -- registers the compiled Torch operator
 
 
 def load_triton_pack(path):
+    import triton.language as tl
+
     spec = importlib.util.spec_from_file_location("_welm_original_ops_padding", path)
     module = importlib.util.module_from_spec(spec)
+    # The baseline imports tl inside its lazy kernel factory. Some Triton
+    # versions resolve JIT names only in fn.__globals__, not closure cells.
+    module.tl = tl
     spec.loader.exec_module(module)
     return module.pack_low_latency_inputs
 
@@ -164,7 +169,7 @@ def profile_graphs(graphs, output, stream):
 
 
 def main():
-    root = Path(__file__).resolve().parents[2]
+    root = Path(__file__).resolve().parents[3]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--rows", type=int, default=4)
