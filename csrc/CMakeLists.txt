@@ -21,6 +21,7 @@ message(STATUS "SGL_KERNEL_ENABLE_A3_ONLY_OPS=${SGL_KERNEL_ENABLE_A3_ONLY_OPS} (
 # Ordinary direct launch remains buildable with older CANN toolchains. Enable
 # this only with a compiler/devkit providing __sk__, SK_BIND and SkSystemArgs.
 option(SGL_WELM_PACK_SUPERKERNEL "Build WeLM decode packing SuperKernel entries" OFF)
+option(SGL_WELM_SIGMOID_MUL_SUPERKERNEL "Build WeLM sigmoid-mul SuperKernel entries" OFF)
 
 # host side files
 set(OP_SRCS
@@ -138,6 +139,24 @@ if(SGL_WELM_PACK_SUPERKERNEL)
     ascendc_compile_definitions(welm_pack_decode_kernel PRIVATE -DSGL_WELM_PACK_SUPERKERNEL)
 endif()
 
+if(_sgl_soc_lower MATCHES "^ascend950")
+    list(APPEND OP_SRCS ${PROJECT_OP_SRC_BASE}/welm_sigmoid_mul/op_host/welm_sigmoid_mul.cpp)
+    ascendc_library(welm_sigmoid_mul_kernel STATIC
+        ${PROJECT_OP_SRC_BASE}/welm_sigmoid_mul/op_kernel/welm_sigmoid_mul_kernel.cpp
+    )
+    # Inference-only kernel: preserve arithmetic/rounding, omit overflow-status
+    # recording. Dependencies are explicit; all options stay on this target.
+    ascendc_compile_options(welm_sigmoid_mul_kernel PRIVATE
+        --cce-auto-sync=off
+        -mllvm
+        -cce-aicore-record-overflow=false
+    )
+    if(SGL_WELM_SIGMOID_MUL_SUPERKERNEL)
+        ascendc_compile_definitions(welm_sigmoid_mul_kernel PRIVATE -DSGL_WELM_SIGMOID_MUL_SUPERKERNEL)
+    endif()
+    list(APPEND A5_ONLY_KERNEL_TARGETS welm_sigmoid_mul_kernel)
+endif()
+
 # kernel side files with workspace
 set(WORKSPACE_KERNEL_SRCS
     ${PROJECT_OP_SRC_BASE}/alloc_extend/op_kernel/alloc_extend_kernel.cpp
@@ -238,6 +257,7 @@ add_library(${OP_PLUGIN_NAME} SHARED ${OP_SRCS})
 
 target_link_libraries(${OP_PLUGIN_NAME} PRIVATE
         ${A3_ONLY_KERNEL_TARGETS}
+        ${A5_ONLY_KERNEL_TARGETS}
         workspace_kernel
         no_workspace_kernel
         welm_pack_decode_kernel

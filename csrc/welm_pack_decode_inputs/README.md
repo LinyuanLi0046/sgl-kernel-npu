@@ -209,14 +209,12 @@ the data path further. The simulator logs are incomplete: they cannot establish
 the full epilogue duration or prove that this sequence explains the entire gap.
 Triton also performs cache maintenance at exit.
 
-The overflow-recording change has not yet been compiled or measured on the
-server. Rebuild and install the new wheel, then use the existing graph benchmark
-and row-sweep collector above/below. Check bitwise correctness, graph latency,
-Scalar time and per-block GM traffic against the same baseline. In a new
-instruction trace, verify whether the status-recording sequence disappears;
-if it remains, inspect the actual compiler command and generated binary before
-attributing any timing change to the option. No performance target is claimed
-as met until a matched device rerun confirms it.
+After rebuilding the overflow-recording change, the user reported performance
+parity with Triton and accepted the result. A post-change JSON/PMU or instruction
+trace was not supplied, so no exact new latency or epilogue instruction removal
+is independently confirmed here. The two raw profiling packages were deleted at
+the user's request;
+the baseline measurements above and the reusable comparison/collector remain.
 
 The Triton source is identical between revisions `7c81be8` and `2f45a31`.
 Their timing code is also identical, but `2f45a31` added eager correctness cases
