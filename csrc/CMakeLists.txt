@@ -124,6 +124,9 @@ ascendc_library(welm_pack_decode_kernel STATIC
     ${PROJECT_OP_SRC_BASE}/welm_pack_decode_inputs/op_kernel/welm_pack_decode_inputs_kernel.cpp
 )
 ascendc_compile_options(welm_pack_decode_kernel PRIVATE --cce-auto-sync=off)
+if(_sgl_soc_lower MATCHES "^ascend950")
+    ascendc_compile_definitions(welm_pack_decode_kernel PRIVATE -DSGL_WELM_PACK_A5)
+endif()
 if(SGL_WELM_PACK_SUPERKERNEL)
     ascendc_compile_definitions(welm_pack_decode_kernel PRIVATE -DSGL_WELM_PACK_SUPERKERNEL)
 endif()

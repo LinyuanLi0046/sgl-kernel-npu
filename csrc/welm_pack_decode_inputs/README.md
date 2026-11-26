@@ -50,7 +50,7 @@ dummy fill is not assumed to be zero.
 The small-kernel path uses directly constructed `LocalTensor`s, fixed UB
 addresses and fixed event IDs, without `TPipe`/`TBuf` initialization or dynamic
 event allocation. `InitSocState()` still initializes the hardware state. Input
-DMA fills the valid prefix and its 32-byte alignment padding; `Duplicate` fills
+DMA fills the valid prefix and its 32-byte alignment padding; vector stores fill
 only the disjoint remaining tail. Both routing arrays are submitted before
 waiting on their producers, then both outputs are stored. Ordinary kernels end
 with `PipeBarrier<PIPE_ALL>()`; SK entries drain MTE3 locally without PIPE_ALL.
@@ -100,6 +100,31 @@ The packing kernel has its own Ascend C build target with
 `--cce-auto-sync=off`, because its dependencies are handled explicitly. This
 setting does not apply to other operators in the wheel. Both ordinary and SK
 builds require the static-LocalTensor APIs, including `InitSocState()`.
+
+On Ascend 950 builds, tail filling uses an explicit `__simd_vf__` with
+`MicroAPI::Duplicate`, `UpdateMask` and `StoreAlign`. The routing core fills both
+IDs and weights in one VF, sharing the zero register, loop and mask; hidden
+cores use the same implementation with one destination. Other SoCs retain the
+`LocalTensor` `Duplicate` API. The architecture selection is automatic at build
+time and adds no runtime environment variable or public Torch entry.
+
+`rows`, `capacity` and the existing partition remain runtime arguments. There
+are no capacity-specific or row-specific entry points. For `N=4, C=8`, each
+routing tail has 40 uint32 words: one VF iteration writes 40 words to each of
+the two disjoint buffers. For `N=6`, input DMA explicitly pads 60 words to 64,
+and the VF writes the remaining 16 words per array. A masked final VF store
+also handles the general tail sizes up to C=128. Input DMA requests zero
+padding only when the valid prefix actually needs alignment padding.
+
+Implementation references (ops-nn revision `267827973`):
+
+- `pooling/pool_3d_common/op_kernel/arch35/copy_pad_impl.h`,
+  `CopyPad::CustomDuplicate`: zero register, `UpdateMask`, masked UB stores.
+- `index/reverse_v2/op_kernel/arch35/reverse_v2_simd.h`: explicit
+  `__simd_vf__` body separate from GM/UB staging. Launch syntax follows the
+  [official asc_vf_call API](https://asc.gitcode.com/api/SIMD-API/basic_api/reg_vector_compute/vf_call/asc_vf_call.html).
+- cannbot `ascendc-perf-optimize` and `ascendc-regbase-best-practice`: small
+  operator scalar overhead, VF boundaries and synchronization review.
 
 The ordinary and SK builds have not been compiled or executed on an NPU in the
 Windows development workspace. API presence in Python alone does not establish
@@ -153,14 +178,17 @@ in the expected SK), and compare matched device-task durations with the original
 2-us observation. The standalone comparison does not establish full-MoE latency
 or communication overlap. No sub-2-us result is claimed before device measurement.
 
-The previous implementation was reported on the server at 5.x us versus
-Triton's 2.x us for `C=8, N=4/6`, using this script's default **graph** mode and
-`median_us`; a regression was also reported at C=128. Those observations show
-that the previous implementation missed the performance target. The revision
-above removes source-level overheads identified using the small-kernel scalar
-guidance in `cannbot-skills/ops/ascendc-perf-optimize` and
-`ascendc-performance-best-practices`; it has not yet been compiled or timed on
-the server. It does not establish which instruction/pipeline accounted for the
-reported gap. Timing, baseline selection and the acceptance threshold are
-unchanged. In graph replay, host metadata checks and output allocations are
-not repeated and cannot explain that device-side timing gap.
+The most recent server report before the explicit-VF change is a stable
+3.2 us for Ascend C versus 1.7 us for Triton at `N=4, C=8`, using the default
+**graph** mode's `median_us`. The performance target has not been met. The VF
+revision has not yet been compiled or timed on the server; source analysis
+alone does not attribute the 1.5-us gap to any specific instruction/pipeline.
+
+The Triton source is identical between revisions `7c81be8` and `2f45a31`.
+Their timing code is also identical, but `2f45a31` added eager correctness cases
+before measurement. Consequently, the earlier reported change from 2.x to
+1.7 us for Triton is not evidence of a Triton code optimization; the exact
+cause requires matched runtime evidence. This VF revision leaves the entire
+comparison script unchanged, including those pre-measurement cases. In graph
+replay, host metadata checks and output allocations are not repeated and cannot
+explain the device-side timing gap.

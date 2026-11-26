@@ -37,10 +37,34 @@ __aicore__ inline void Fence()
     WaitFlag<event>(EVENT_ID0);
 }
 
+#ifdef SGL_WELM_PACK_A5
+// Register-store pattern: ops-nn arch35 CopyPad::CustomDuplicate. Keep both
+// routing tails in one VF, sharing the zero register and the loop/mask setup.
+// The only VF memory accesses are masked UB stores; GM DMA stays outside VF.
+template <bool paired>
+__simd_vf__ inline void ZeroTailVf(__ubuf__ uint32_t *first, uint32_t words)
+{
+    constexpr uint32_t regWords = VECTOR_REG_WIDTH / sizeof(uint32_t);
+    const uint16_t repeats = (words + regWords - 1) / regWords;
+    uint32_t remaining = words;
+    MicroAPI::RegTensor<uint32_t> zero;
+    MicroAPI::Duplicate(zero, uint32_t{0});
+    for (uint16_t i = 0; i < repeats; ++i) {
+        // UpdateMask advances remaining; do not decrement it a second time.
+        MicroAPI::MaskReg mask = MicroAPI::UpdateMask<uint32_t>(remaining);
+        MicroAPI::StoreAlign(first + i * regWords, zero, mask);
+        if constexpr (paired) {
+            // The routing buffers have this fixed separation in RunPack.
+            MicroAPI::StoreAlign(first + welm_pack::ROUTE_BUFFER_WORDS + i * regWords, zero, mask);
+        }
+    }
+}
+#endif
+
 // The source is read only over the valid prefix. Padding is generated in UB;
 // IDs and FP32 weights are also copied as raw words, preserving every bit.
-__aicore__ inline void PreparePadded(LocalTensor<uint32_t> local, GM_ADDR src,
-                                    uint32_t offset, uint32_t count, uint32_t valid)
+__aicore__ inline void LoadPrefix(LocalTensor<uint32_t> local, GM_ADDR src,
+                                 uint32_t offset, uint32_t valid)
 {
     if (valid > 0) {
         GlobalTensor<uint32_t> input;
@@ -49,16 +73,30 @@ __aicore__ inline void PreparePadded(LocalTensor<uint32_t> local, GM_ADDR src,
         // A partial route chunk need not end on 32 bytes (topk is 10).
         // Specify rightPadding explicitly: with both padding counts zero,
         // DMA alignment bytes may repeat the first element of the input.
-        const DataCopyPadExtParams<uint32_t> padding{
-            true, 0, static_cast<uint8_t>(AlignWords(valid) - valid), 0};
+        const uint8_t rightPadding = static_cast<uint8_t>(AlignWords(valid) - valid);
+        const DataCopyPadExtParams<uint32_t> padding{rightPadding != 0, 0, rightPadding, 0};
         DataCopyPad(local, input, copyIn, padding);
     }
+}
+
+template <bool paired>
+__aicore__ inline void ZeroTail(LocalTensor<uint32_t> first, LocalTensor<uint32_t> second,
+                               uint32_t count, uint32_t valid)
+{
     const uint32_t alignedValid = AlignWords(valid);
     const uint32_t alignedCount = AlignWords(count);
     if (alignedValid < alignedCount) {
         // The DMA (including its right padding) and vector fill write disjoint
         // 32-byte blocks. No V -> MTE2 dependency is needed between them.
-        Duplicate(local[alignedValid], uint32_t{0}, alignedCount - alignedValid);
+#ifdef SGL_WELM_PACK_A5
+        auto firstAddr = reinterpret_cast<__ubuf__ uint32_t *>(first.GetPhyAddr()) + alignedValid;
+        asc_vf_call<ZeroTailVf<paired>>(firstAddr, alignedCount - alignedValid);
+#else
+        Duplicate(first[alignedValid], uint32_t{0}, alignedCount - alignedValid);
+        if constexpr (paired) {
+            Duplicate(second[alignedValid], uint32_t{0}, alignedCount - alignedValid);
+        }
+#endif
     }
 }
 
@@ -105,7 +143,8 @@ __aicore__ inline void RunPack(const PackArgs &args, uint32_t blockIdx)
         const uint32_t validTotal = args.rows * welm_pack::HIDDEN_WORDS;
         const uint32_t valid = offset < validTotal ? Min(count, validTotal - offset) : 0;
         LocalTensor<uint32_t> local(TPosition::VECIN, 0, count);
-        PreparePadded(local, args.hidden, offset, count, valid);
+        LoadPrefix(local, args.hidden, offset, valid);
+        ZeroTail<false>(local, local, count, valid);
         WaitPadded(count, valid);
         StorePadded(local, args.hiddenOut, offset, count);
     } else {
@@ -121,8 +160,9 @@ __aicore__ inline void RunPack(const PackArgs &args, uint32_t blockIdx)
             welm_pack::ROUTE_BUFFER_WORDS * sizeof(uint32_t), welm_pack::ROUTE_BUFFER_WORDS);
         // Submit both arrays before waiting. Their input copies and zero fills
         // are independent; one pair of events covers both arrays' producers.
-        PreparePadded(idsLocal, args.ids, offset, count, valid);
-        PreparePadded(weightsLocal, args.weights, offset, count, valid);
+        LoadPrefix(idsLocal, args.ids, offset, valid);
+        LoadPrefix(weightsLocal, args.weights, offset, valid);
+        ZeroTail<true>(idsLocal, weightsLocal, count, valid);
         WaitPadded(count, valid);
         StorePadded(idsLocal, args.idsOut, offset, count);
         StorePadded(weightsLocal, args.weightsOut, offset, count);
