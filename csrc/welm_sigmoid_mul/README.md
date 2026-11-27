@@ -164,3 +164,47 @@ This revision has no NPU compilation or timing result from the Windows
 workspace. The Decode performance target is **faster than Triton**, and remains
 pending a matched server run. Packing reaching parity does not establish a
 speedup for this different, arithmetic operator.
+
+## Collect an eager crash and launch artifacts
+
+Use the same Python environment and installed wheel as the failing server.
+Keep the original build directory until collection is complete: rebuilding
+could replace the generated launch code and device binary needed for diagnosis.
+
+```bash
+cd /data2/hw_lly/sgl-kernel-npu
+python3 tests/python/sgl_kernel_npu/collect_welm_sigmoid_crash.py --device 0
+
+# If the original build is elsewhere, or its console log was saved:
+python3 tests/python/sgl_kernel_npu/collect_welm_sigmoid_crash.py \
+  --build-dir /path/to/original/build --build-log /path/to/build.log
+```
+
+Default: **one functional eager call**, BF16 gate `[8,24,1]` and attention
+`[8,24,256]`, followed by synchronization. `--batch` and `--heads` change that
+single case; `--device` is a logical device within the existing visibility
+settings. This collector does not launch SGLang or run a performance benchmark,
+graph capture, static compilation, or SuperKernel optimization.
+
+The standard-library parent survives a failed/aborted child. `--timeout 180`
+limits the reproduction subprocess; timeout termination also targets its owned
+process group. Evidence is packaged even when the reproduction fails:
+
+| Archive content | Purpose |
+| --- | --- |
+| `repro/run.log`, `worker.json`, `inputs.pt` | Traceback, exit status, last entered phase, exact inputs and tensor addresses. Successful calls also save outputs/reference and numerical diagnostics; these are not a full accuracy test. |
+| `loaded_extension/`, `installed_package/` | Actual loaded extension, its pre-launch SHA256, package source, and extension mappings. An import-failure candidate is explicitly marked unconfirmed. |
+| `build_artifacts/`, `sources/`, `build_logs/` | Operator target trees, generated launch headers/registration code, objects, build configuration, current source, and optional original build logs. These candidates are not assumed to match the installed wheel. |
+| `device_from_loaded_extension/`, `binary_inspection/` | If available, CANN `msobjdump` extracts sigmoid device ELF from the loaded `.so` and records metadata/disassembly. Unsupported tool features are reported; raw binaries remain available. |
+| `runtime_logs/`, `runtime_work/`, `exception_dump/` | Private destinations for this child's CANN logs and exception artifacts. Fallback plog collection selects only this PID and collection time window. |
+| `manifest.json`, `SUMMARY.txt` | Collection completeness, missing artifacts, command results, source paths and hashes. Reproduction status is separate from collection status. |
+
+Output: `output/welm_sigmoid_crash_<timestamp>.tar.gz` plus its SHA256 file.
+Exit 1 means reproduction failure or incomplete collection; it does **not** mean
+the archive was discarded. Missing build artifacts are reported, not rebuilt.
+The script reuses the adjacent `collect_welm_pack_profiles.py` helpers; keep both
+files when copying it to another checkout. `--dry-run` packages source/build
+evidence without importing Torch or executing NPU/inspection commands.
+
+References: [CANN exception collection paths](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/900/maintenref/troubleshooting/troubleshooting_0006.html),
+[msobjdump ELF extraction and disassembly](https://asc.gitcode.com/guide/programming_guide/appendix/msobjdump_tool.html).
