@@ -126,17 +126,13 @@ __aicore__ inline void RunSigmoidMul(const SigmoidMulArgs &args, uint32_t blockI
 }
 }  // namespace
 
-#ifdef SGL_WELM_SIGMOID_MUL_SUPERKERNEL
-extern "C" __global__ __vector__ void welm_sigmoid_mul_kernel(
-#else
+// Keep the ordinary entry compatible with ascendc_library's auto_gen wrapper.
+// Its AIV task type is independent of the separate __sk__ entry below.
 extern "C" __global__ __aicore__ void welm_sigmoid_mul_kernel(
-#endif
     GM_ADDR gate, GM_ADDR attention, GM_ADDR output,
     uint32_t rows, uint32_t tileRows, uint32_t activeCores)
 {
-#ifndef SGL_WELM_SIGMOID_MUL_SUPERKERNEL
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-#endif
     const SigmoidMulArgs args{gate, attention, output, rows, tileRows, activeCores};
     RunSigmoidMul<false>(args, GetBlockIdx());
 }

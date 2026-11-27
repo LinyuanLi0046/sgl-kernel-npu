@@ -180,18 +180,14 @@ __aicore__ inline void RunPack(const PackArgs &args, uint32_t blockIdx)
 }
 }  // namespace
 
-#ifdef SGL_WELM_PACK_SUPERKERNEL
-extern "C" __global__ __vector__ void welm_pack_decode_inputs_kernel(
-#else
+// Keep the ordinary entry compatible with ascendc_library's auto_gen wrapper.
+// Its AIV task type is independent of the separate __sk__ entry below.
 extern "C" __global__ __aicore__ void welm_pack_decode_inputs_kernel(
-#endif
     GM_ADDR hidden, GM_ADDR ids, GM_ADDR weights,
     GM_ADDR hiddenOut, GM_ADDR idsOut, GM_ADDR weightsOut,
     uint32_t rows, uint32_t capacity, uint32_t hiddenCores, uint32_t hiddenBaseTiles)
 {
-#ifndef SGL_WELM_PACK_SUPERKERNEL
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-#endif
     const PackArgs args{hidden, ids, weights, hiddenOut, idsOut, weightsOut,
                         rows, capacity, hiddenCores, hiddenBaseTiles};
     RunPack<false>(args, AscendC::GetBlockIdx());
