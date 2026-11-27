@@ -89,15 +89,17 @@ previous packing op does not establish support for register Gather.
 From the existing sgl-kernel-npu repository, using the server's CANN environment:
 
 ```bash
+# Includes explicit SK entries by default:
 bash build.sh -a kernels Ascend950DT_9582
-# To also emit explicit SK entries:
-SGL_WELM_SIGMOID_MUL_SUPERKERNEL=ON bash build.sh -a kernels Ascend950DT_9582
+# To build only the ordinary direct-launch kernel:
+SGL_WELM_SIGMOID_MUL_SUPERKERNEL=OFF bash build.sh -a kernels Ascend950DT_9582
 ```
 
 Install the newly generated `output/sgl_kernel_npu-*.whl` in the Python
 environment used below. The build command packages but does not install it.
-The SK switch is build-time only; it reuses the packing SK_BIND structure and
-does not change packing's independent `SGL_WELM_PACK_SUPERKERNEL` setting.
+The SK switch is build-time only and defaults to ON, requiring a compiler/devkit
+with `__sk__`, `SK_BIND` and `SkSystemArgs`. It reuses the packing SK_BIND structure
+and does not change packing's independent `SGL_WELM_PACK_SUPERKERNEL` setting.
 
 ## Correctness and performance comparison
 

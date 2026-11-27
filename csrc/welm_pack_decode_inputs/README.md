@@ -77,11 +77,11 @@ by the installed CANN:
 bash build.sh -a kernels YOUR_CANN_SOC_VERSION
 ```
 
-The default builds the ordinary direct-launch entry without requiring the
-SuperKernel compiler features. To also emit the explicit SuperKernel entries:
+The default builds both the ordinary direct-launch entry and the explicit
+SuperKernel entries. To build only the ordinary direct-launch entry:
 
 ```bash
-SGL_WELM_PACK_SUPERKERNEL=ON bash build.sh -a kernels YOUR_CANN_SOC_VERSION
+SGL_WELM_PACK_SUPERKERNEL=OFF bash build.sh -a kernels YOUR_CANN_SOC_VERSION
 ```
 
 Install the newly generated `output/sgl_kernel_npu-*.whl` into the same Python

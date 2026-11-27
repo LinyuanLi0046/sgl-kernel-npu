@@ -18,10 +18,12 @@ if(SGL_KERNEL_ENABLE_A3_ONLY_OPS)
 endif()
 message(STATUS "SGL_KERNEL_ENABLE_A3_ONLY_OPS=${SGL_KERNEL_ENABLE_A3_ONLY_OPS} (SOC=${SOC_VERSION})")
 
-# Ordinary direct launch remains buildable with older CANN toolchains. Enable
-# this only with a compiler/devkit providing __sk__, SK_BIND and SkSystemArgs.
-option(SGL_WELM_PACK_SUPERKERNEL "Build WeLM decode packing SuperKernel entries" OFF)
-option(SGL_WELM_SIGMOID_MUL_SUPERKERNEL "Build WeLM sigmoid-mul SuperKernel entries" OFF)
+# Include packing SK entries by default; this requires __sk__, SK_BIND and
+# SkSystemArgs. Set OFF explicitly to build only the ordinary direct launch.
+option(SGL_WELM_PACK_SUPERKERNEL "Build WeLM decode packing SuperKernel entries" ON)
+# Include SK entries for Ascend 950 sigmoid-mul by default. Set OFF explicitly
+# when building without a compiler/devkit providing the SK APIs above.
+option(SGL_WELM_SIGMOID_MUL_SUPERKERNEL "Build WeLM sigmoid-mul SuperKernel entries" ON)
 
 # host side files
 set(OP_SRCS
