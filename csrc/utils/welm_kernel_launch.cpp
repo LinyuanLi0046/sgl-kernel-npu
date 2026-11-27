@@ -58,13 +58,10 @@ aclrtFuncHandle GetFunction(Kernel kernel)
     if (!entry.function) {
         const char *name = KERNEL_NAMES[index];
         const auto path = BinaryPath(name);
-        aclrtBinaryLoadOption option{};
-        option.type = ACL_RT_BINARY_LOAD_OPT_MAGIC;
-        option.value.magic = ACL_RT_BINARY_MAGIC_ELF_VECTOR_CORE;
-        aclrtBinaryLoadOptions options{};
-        options.numOpt = 1;
-        options.options = &option;
-        auto status = aclrtBinaryLoadFromFile(path.c_str(), &options, &entry.binary);
+        // CANN rejects MAGIC options for LoadFromFile (supported by the data
+        // loading API instead). File loading uses the ELF metadata; the build
+        // checker requires K_TYPE_AIV on our ordinary entry.
+        auto status = aclrtBinaryLoadFromFile(path.c_str(), nullptr, &entry.binary);
         TORCH_CHECK(status == ACL_SUCCESS, "WeLM: loading ", path, " failed, ACL error ", status);
         // Several SK functions carry the same tiling key. Resolve ONLY the
         // ordinary global by name; never use tilingKey=0 to select a function.

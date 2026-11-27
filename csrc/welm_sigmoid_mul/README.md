@@ -127,6 +127,11 @@ Install the **whole newly built wheel**, and restart the server workers.
 Replacing only the `.so` is insufficient. The private launcher resolves this
 installed directory with `dladdr`, loads the AIV ELF, and selects the ordinary
 entry with [aclrtBinaryGetFunction](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/910/API/runtimeapi/aclcppdevg_03_0150.html).
+File loading passes `nullptr` for options, as in the
+[CANN loading example](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/910/others/acldevg/runtime_doc_dev_0019.html).
+Do not pass `ACL_RT_BINARY_LOAD_OPT_MAGIC` to `aclrtBinaryLoadFromFile`:
+the server runtime rejects it with ACL error 107000 before loading the kernel.
+The ordinary entry's AIV type is carried by the checked ELF metadata.
 [aclrtLaunchKernelWithHostArgs](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/910/API/runtimeapi/aclcppdevg_03_1961.html)
 passes the shared host/SK argument layout through the existing `OpCommand`
 queue/current stream. Arguments are owned by the queued callback.
