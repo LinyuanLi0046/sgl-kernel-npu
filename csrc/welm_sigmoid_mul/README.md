@@ -101,6 +101,82 @@ The SK switch is build-time only and defaults to ON, requiring a compiler/devkit
 with `__sk__`, `SK_BIND` and `SkSystemArgs`. It reuses the packing SK_BIND structure
 and does not change packing's independent `SGL_WELM_PACK_SUPERKERNEL` setting.
 
+### 950 named-launch fix for the ordinary/SK entry collision
+
+With the respective SK build option ON, sigmoid-mul and packing now compile
+their original source directly to AIV ELF. The CANN 9.1 legacy `auto_gen` path
+renamed the normal entry to `*_origin` inside `SK_BIND` and registered the
+ordinary/SK functions under the same tiling key. The captured eager crash
+actually entered an SK function with ordinary arguments. Changing the Torch
+schema or just choosing another tiling key would not fix the incorrect binding.
+
+The two targets use `cmake/welm_named_kernel.cmake`; other kernels and the
+SK-OFF build keep their existing pipeline. Each raw ELF retains the original
+global symbol, its AIV metadata, and the ordinary entry's required teardown.
+`cmake/check_welm_kernel_elf.py` rejects missing/renamed globals, incorrect AIV
+metadata, and SK_BIND addresses that do not match the ordinary and four SK
+entries. This check runs during the build, before staging the binary.
+
+The wheel's existing `lib/**` packaging includes both device files beside
+`libsgl_kernel_npu.so`:
+
+- `welm_sigmoid_mul_kernel.o`
+- `welm_pack_decode_inputs_kernel.o`
+
+Install the **whole newly built wheel**, and restart the server workers.
+Replacing only the `.so` is insufficient. The private launcher resolves this
+installed directory with `dladdr`, loads the AIV ELF, and selects the ordinary
+entry with [aclrtBinaryGetFunction](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/910/API/runtimeapi/aclcppdevg_03_0150.html).
+[aclrtLaunchKernelWithHostArgs](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/910/API/runtimeapi/aclcppdevg_03_1961.html)
+passes the shared host/SK argument layout through the existing `OpCommand`
+queue/current stream. Arguments are owned by the queued callback.
+
+Binary/function handles are cached per runtime context, with a thread-local
+warm path. Run the existing eager warmup before graph capture. Warm launches
+do not reopen files, load binaries, allocate a tiling/overflow buffer, or add
+device synchronization. Handles remain alive for captured graphs until process
+teardown; restart the worker after a device/context reset. Torch schemas, Meta,
+tiling, VF arithmetic, and SGLang call sites are unchanged.
+
+After building/installing, this small check reuses existing input/reference
+helpers and exercises both ordinary launch ABIs without Triton compilation or
+performance measurement:
+
+```bash
+python3 - <<'PY'
+import sys
+sys.path.insert(0, "tests/python/sgl_kernel_npu")
+import torch
+import torch_npu
+import sgl_kernel_npu
+from bench_welm_sigmoid_mul import make_inputs, reference, assert_result
+from bench_welm_pack_decode_inputs import make_inputs as pack_inputs, assert_pack
+
+torch.npu.set_device(0)
+torch.npu.set_compile_mode(jit_compile=False)
+gate, attention = make_inputs(8, 24, "npu:0")
+expected = reference(gate, attention)
+result = torch.ops.npu.welm_sigmoid_mul(gate, attention)
+torch.npu.synchronize()
+assert_result(result, expected)
+result = torch.ops.npu.welm_sigmoid_mul_(gate, attention)
+torch.npu.synchronize()
+assert result.data_ptr() == attention.data_ptr()
+assert_result(result, expected)
+for capacity in (8, 128):
+    inputs = pack_inputs(4, "npu:0", 2026)
+    outputs = torch.ops.npu.welm_pack_decode_inputs(*inputs, capacity)
+    torch.npu.synchronize()
+    assert_pack(inputs, outputs, capacity)
+print("sigmoid functional/inplace and pack C=8/128 eager: PASS")
+PY
+```
+
+This is an eager launch check, not proof of static/SuperKernel fusion or speed.
+Use the existing benchmarks below and the packing benchmark for those modes.
+The Windows workspace cannot compile CANN or execute NPU kernels; both the
+new device build and device-mode validation remain required on the server.
+
 ## Correctness and performance comparison
 
 The script loads the **unchanged** original Triton kernel and wrapper from
@@ -196,6 +272,7 @@ process group. Evidence is packaged even when the reproduction fails:
 | `loaded_extension/`, `installed_package/` | Actual loaded extension, its pre-launch SHA256, package source, and extension mappings. An import-failure candidate is explicitly marked unconfirmed. |
 | `build_artifacts/`, `sources/`, `build_logs/` | Operator target trees, generated launch headers/registration code, objects, build configuration, current source, and optional original build logs. These candidates are not assumed to match the installed wheel. |
 | `device_from_loaded_extension/`, `binary_inspection/` | If available, CANN `msobjdump` extracts sigmoid device ELF from the loaded `.so` and records metadata/disassembly. Unsupported tool features are reported; raw binaries remain available. |
+| `device_payload/` | For the named-launch build, external WeLM ELF files beside the loaded extension and their pre-launch hashes. Presence identifies an installed candidate; plog still establishes which function actually ran. |
 | `runtime_logs/`, `runtime_work/`, `exception_dump/` | Private destinations for this child's CANN logs and exception artifacts. Fallback plog collection selects only this PID and collection time window. |
 | `manifest.json`, `SUMMARY.txt` | Collection completeness, missing artifacts, command results, source paths and hashes. Reproduction status is separate from collection status. |
 

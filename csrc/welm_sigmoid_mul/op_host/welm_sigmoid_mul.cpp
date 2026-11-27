@@ -1,7 +1,14 @@
 // Copyright (c) 2026. Licensed under the BSD 3-Clause License.
+#include "acl/acl.h"
+#ifndef SGL_WELM_NAMED_LAUNCH
 #include "aclrtlaunch_welm_sigmoid_mul_kernel.h"
+#endif
 #include "tiling/platform/platform_ascendc.h"
 #include "torch_helper.h"
+#ifdef SGL_WELM_NAMED_LAUNCH
+#include "welm_kernel_args.h"
+#include "welm_kernel_launch.h"
+#endif
 #include "../sigmoid_mul_config.h"
 
 #include <algorithm>
@@ -45,7 +52,13 @@ void Launch(const at::Tensor &gate, const at::Tensor &attention, const at::Tenso
     // Recompute the launch count after rounding up rows/core: do not launch
     // empty cores (e.g. six heads are split into two tiles of three heads).
     const uint32_t blockDim = std::min(activeCores, (rows + tileRows - 1) / tileRows);
+#ifdef SGL_WELM_NAMED_LAUNCH
+    const welm::SigmoidMulArgs<void *> args{
+        gate.data_ptr(), attention.data_ptr(), output.data_ptr(), rows, tileRows, blockDim};
+    welm::Launch(welm::Kernel::SigmoidMul, "welm_sigmoid_mul_kernel", blockDim, args);
+#else
     EXEC_KERNEL_CMD(welm_sigmoid_mul_kernel, blockDim, gate, attention, output, rows, tileRows, blockDim);
+#endif
 }
 
 at::Tensor SigmoidMulMeta(const at::Tensor &gate, const at::Tensor &attention)

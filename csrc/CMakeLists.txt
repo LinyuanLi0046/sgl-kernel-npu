@@ -123,40 +123,62 @@ endif()
 
 # Packing manages its pipeline events explicitly. Isolate this option from all
 # other direct-launch kernels, which keep their existing compiler settings.
-ascendc_library(welm_pack_decode_kernel STATIC
-    ${PROJECT_OP_SRC_BASE}/welm_pack_decode_inputs/op_kernel/welm_pack_decode_inputs_kernel.cpp
-)
-ascendc_compile_options(welm_pack_decode_kernel PRIVATE --cce-auto-sync=off)
-if(_sgl_soc_lower MATCHES "^ascend950")
-    ascendc_compile_definitions(welm_pack_decode_kernel PRIVATE -DSGL_WELM_PACK_A5)
-    # Packing copies raw uint32 words and fills zeros; it performs no floating-
-    # point arithmetic. Avoid recording numeric overflow status at kernel exit.
-    # Keep this local to packing; arithmetic kernels retain their defaults.
-    ascendc_compile_options(welm_pack_decode_kernel PRIVATE
-        -mllvm
-        -cce-aicore-record-overflow=false
-    )
+if(_sgl_soc_lower MATCHES "^ascend950" AND (SGL_WELM_PACK_SUPERKERNEL OR SGL_WELM_SIGMOID_MUL_SUPERKERNEL))
+    include(${PROJECT_SOURCE_DIR}/cmake/welm_named_kernel.cmake)
+    list(APPEND OP_SRCS ${PROJECT_OP_SRC_BASE}/utils/welm_kernel_launch.cpp)
 endif()
-if(SGL_WELM_PACK_SUPERKERNEL)
-    ascendc_compile_definitions(welm_pack_decode_kernel PRIVATE -DSGL_WELM_PACK_SUPERKERNEL)
+if(_sgl_soc_lower MATCHES "^ascend950" AND SGL_WELM_PACK_SUPERKERNEL)
+    sgl_welm_named_kernel(welm_pack_decode_kernel
+        ${PROJECT_OP_SRC_BASE}/welm_pack_decode_inputs/op_kernel/welm_pack_decode_inputs_kernel.cpp
+        welm_pack_decode_inputs_kernel SGL_WELM_PACK_SUPERKERNEL
+        ${PROJECT_OP_SRC_BASE}/welm_pack_decode_inputs/pack_config.h -DSGL_WELM_PACK_A5)
+    set_source_files_properties(${PROJECT_OP_SRC_BASE}/welm_pack_decode_inputs/op_host/welm_pack_decode_inputs.cpp
+        PROPERTIES COMPILE_DEFINITIONS SGL_WELM_NAMED_LAUNCH)
+    list(APPEND WELM_NAMED_KERNEL_TARGETS welm_pack_decode_kernel)
+else()
+    ascendc_library(welm_pack_decode_kernel STATIC
+        ${PROJECT_OP_SRC_BASE}/welm_pack_decode_inputs/op_kernel/welm_pack_decode_inputs_kernel.cpp
+    )
+    ascendc_compile_options(welm_pack_decode_kernel PRIVATE --cce-auto-sync=off)
+    if(_sgl_soc_lower MATCHES "^ascend950")
+        ascendc_compile_definitions(welm_pack_decode_kernel PRIVATE -DSGL_WELM_PACK_A5)
+        # Packing copies raw uint32 words and fills zeros; it performs no floating-
+        # point arithmetic. Avoid recording numeric overflow status at kernel exit.
+        # Keep this local to packing; arithmetic kernels retain their defaults.
+        ascendc_compile_options(welm_pack_decode_kernel PRIVATE
+            -mllvm
+            -cce-aicore-record-overflow=false
+        )
+    endif()
+    if(SGL_WELM_PACK_SUPERKERNEL)
+        ascendc_compile_definitions(welm_pack_decode_kernel PRIVATE -DSGL_WELM_PACK_SUPERKERNEL)
+    endif()
+    list(APPEND WELM_LEGACY_KERNEL_TARGETS welm_pack_decode_kernel)
 endif()
 
 if(_sgl_soc_lower MATCHES "^ascend950")
     list(APPEND OP_SRCS ${PROJECT_OP_SRC_BASE}/welm_sigmoid_mul/op_host/welm_sigmoid_mul.cpp)
-    ascendc_library(welm_sigmoid_mul_kernel STATIC
-        ${PROJECT_OP_SRC_BASE}/welm_sigmoid_mul/op_kernel/welm_sigmoid_mul_kernel.cpp
-    )
-    # Inference-only kernel: preserve arithmetic/rounding, omit overflow-status
-    # recording. Dependencies are explicit; all options stay on this target.
-    ascendc_compile_options(welm_sigmoid_mul_kernel PRIVATE
-        --cce-auto-sync=off
-        -mllvm
-        -cce-aicore-record-overflow=false
-    )
     if(SGL_WELM_SIGMOID_MUL_SUPERKERNEL)
-        ascendc_compile_definitions(welm_sigmoid_mul_kernel PRIVATE -DSGL_WELM_SIGMOID_MUL_SUPERKERNEL)
+        sgl_welm_named_kernel(welm_sigmoid_mul_kernel
+            ${PROJECT_OP_SRC_BASE}/welm_sigmoid_mul/op_kernel/welm_sigmoid_mul_kernel.cpp
+            welm_sigmoid_mul_kernel SGL_WELM_SIGMOID_MUL_SUPERKERNEL
+            ${PROJECT_OP_SRC_BASE}/welm_sigmoid_mul/sigmoid_mul_config.h)
+        set_source_files_properties(${PROJECT_OP_SRC_BASE}/welm_sigmoid_mul/op_host/welm_sigmoid_mul.cpp
+            PROPERTIES COMPILE_DEFINITIONS SGL_WELM_NAMED_LAUNCH)
+        list(APPEND WELM_NAMED_KERNEL_TARGETS welm_sigmoid_mul_kernel)
+    else()
+        ascendc_library(welm_sigmoid_mul_kernel STATIC
+            ${PROJECT_OP_SRC_BASE}/welm_sigmoid_mul/op_kernel/welm_sigmoid_mul_kernel.cpp
+        )
+        # Inference-only kernel: preserve arithmetic/rounding, omit overflow-status
+        # recording. Dependencies are explicit; all options stay on this target.
+        ascendc_compile_options(welm_sigmoid_mul_kernel PRIVATE
+            --cce-auto-sync=off
+            -mllvm
+            -cce-aicore-record-overflow=false
+        )
+        list(APPEND A5_ONLY_KERNEL_TARGETS welm_sigmoid_mul_kernel)
     endif()
-    list(APPEND A5_ONLY_KERNEL_TARGETS welm_sigmoid_mul_kernel)
 endif()
 
 # kernel side files with workspace
@@ -256,13 +278,18 @@ endif()
 
 # create shared library
 add_library(${OP_PLUGIN_NAME} SHARED ${OP_SRCS})
+if(WELM_NAMED_KERNEL_TARGETS)
+    add_dependencies(${OP_PLUGIN_NAME} ${WELM_NAMED_KERNEL_TARGETS})
+    # Named kernel loading/launching uses the public runtime API directly.
+    target_link_libraries(${OP_PLUGIN_NAME} PRIVATE acl_rt)
+endif()
 
 target_link_libraries(${OP_PLUGIN_NAME} PRIVATE
         ${A3_ONLY_KERNEL_TARGETS}
         ${A5_ONLY_KERNEL_TARGETS}
         workspace_kernel
         no_workspace_kernel
-        welm_pack_decode_kernel
+        ${WELM_LEGACY_KERNEL_TARGETS}
         ${CATLASS_WORKSPACE_KERNEL_TARGETS}
         torch_npu
         ascendcl

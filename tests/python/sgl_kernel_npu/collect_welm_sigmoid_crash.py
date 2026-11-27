@@ -85,6 +85,15 @@ def worker(args):
         result["loaded_library_sha256"] = {
             p: sha256(Path(p)) for p in result["loaded_libraries"] if Path(p).is_file()
         }
+        # The named-launch build ships device ELF beside the loaded extension.
+        # Fingerprint before launch; presence alone does not prove it ran.
+        result["device_payload_sha256"] = {}
+        for value in set(result["loaded_libraries"] + result.get("mapped_libraries", [])):
+            library = Path(value).resolve()
+            for name in ("welm_sigmoid_mul_kernel.o", "welm_pack_decode_inputs_kernel.o"):
+                payload = library.parent / name
+                if payload.is_file():
+                    result["device_payload_sha256"][str(payload)] = sha256(payload)
         checkpoint("resolve_operator")
         op = torch.ops.npu.welm_sigmoid_mul.default
         result["schema"] = str(op._schema)
@@ -246,7 +255,7 @@ def inspect_binaries(args, output, manifest):
     if "--sass" not in help_text:
         manifest["warnings"].append("Installed msobjdump has no --sass; device binaries remain available for offline analysis.")
         return
-    candidates = [a for a in manifest["artifacts"] if a["kind"] == "extracted_device"]
+    candidates = [a for a in manifest["artifacts"] if a["kind"] in ("extracted_device", "device_payload")]
     if not candidates:
         candidates = [a for a in manifest["artifacts"] if a["kind"] == "build"]
     seen = set()
@@ -293,7 +302,10 @@ def collect(args):
         print("[1/4] Snapshotting source and build artifacts", flush=True)
         sources = list((repo / "csrc/welm_sigmoid_mul").glob("**/*"))
         sources += [repo / p for p in ("CMakeLists.txt", "csrc/CMakeLists.txt", "build.sh",
-                   "csrc/utils/torch_helper.h", "python/sgl_kernel_npu/sgl_kernel_npu/__init__.py")]
+                   "csrc/utils/torch_helper.h", "csrc/utils/welm_kernel_args.h",
+                   "csrc/utils/welm_kernel_launch.h", "csrc/utils/welm_kernel_launch.cpp",
+                   "cmake/welm_named_kernel.cmake", "cmake/check_welm_kernel_elf.py",
+                   "python/sgl_kernel_npu/sgl_kernel_npu/__init__.py")]
         for source in sources:
             if source.is_file():
                 copy_artifact(source, output / "sources" / source.relative_to(repo), output, manifest, "source")
@@ -363,6 +375,12 @@ def collect(args):
                            if Path(p).resolve() == source.resolve()), None)
             if item and before and item["sha256"] != before:
                 manifest["warnings"].append(f"Loaded library changed during collection: {source}")
+        for index, (value, before) in enumerate(sorted(result.get("device_payload_sha256", {}).items())):
+            source = Path(value)
+            item = copy_artifact(source, output / "device_payload" / str(index) / source.name,
+                                 output, manifest, "device_payload")
+            if item and item["sha256"] != before:
+                manifest["warnings"].append(f"Device payload changed during collection: {source}")
         if result.get("package_origin"):
             source = Path(result["package_origin"])
             copy_artifact(source, output / "installed_package" / "__init__.py", output, manifest, "installed_source")
@@ -391,7 +409,9 @@ def collect(args):
         kinds = {item["kind"] for item in manifest["artifacts"]}
         if "build" not in kinds:
             manifest["warnings"].append("No build artifacts found. Supply the original --build-dir; do not rebuild before collecting it.")
-        if not any(item["kind"] == "build" and Path(item["archive_path"]).name == "aclrtlaunch_welm_sigmoid_mul_kernel.h"
+        named_sigmoid = any(item["kind"] == "device_payload" and Path(item["archive_path"]).name == "welm_sigmoid_mul_kernel.o"
+                            for item in manifest["artifacts"])
+        if not named_sigmoid and not any(item["kind"] == "build" and Path(item["archive_path"]).name == "aclrtlaunch_welm_sigmoid_mul_kernel.h"
                    for item in manifest["artifacts"]):
             manifest["warnings"].append("Generated aclrtlaunch_welm_sigmoid_mul_kernel.h not found; check the original --build-dir.")
         if "loaded_extension" not in kinds:

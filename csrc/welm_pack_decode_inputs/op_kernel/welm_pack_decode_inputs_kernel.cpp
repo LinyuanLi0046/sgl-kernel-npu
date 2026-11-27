@@ -1,22 +1,13 @@
 // Copyright (c) 2026. Licensed under the BSD 3-Clause License.
 #include "kernel_operator.h"
 #include "../pack_config.h"
+#include "../../utils/welm_kernel_args.h"
 
 namespace {
 using namespace AscendC;
 
-struct PackArgs {
-    GM_ADDR hidden;
-    GM_ADDR ids;
-    GM_ADDR weights;
-    GM_ADDR hiddenOut;
-    GM_ADDR idsOut;
-    GM_ADDR weightsOut;
-    uint32_t rows;
-    uint32_t capacity;
-    uint32_t hiddenCores;
-    uint32_t hiddenBaseTiles;
-};
+using PackArgs = sglang::npu_kernel::welm::PackArgs<GM_ADDR>;
+static_assert(sizeof(PackArgs) == 64 && offsetof(PackArgs, hiddenBaseTiles) == 60);
 
 __aicore__ inline uint32_t Min(uint32_t a, uint32_t b)
 {
@@ -180,8 +171,8 @@ __aicore__ inline void RunPack(const PackArgs &args, uint32_t blockIdx)
 }
 }  // namespace
 
-// Keep the ordinary entry compatible with ascendc_library's auto_gen wrapper.
-// Its AIV task type is independent of the separate __sk__ entry below.
+// In the SK-enabled 950 build this original global is both the named launch
+// target and the SK_BIND target. No auto_gen renaming/wrapper participates.
 extern "C" __global__ __aicore__ void welm_pack_decode_inputs_kernel(
     GM_ADDR hidden, GM_ADDR ids, GM_ADDR weights,
     GM_ADDR hiddenOut, GM_ADDR idsOut, GM_ADDR weightsOut,
@@ -191,7 +182,18 @@ extern "C" __global__ __aicore__ void welm_pack_decode_inputs_kernel(
     const PackArgs args{hidden, ids, weights, hiddenOut, idsOut, weightsOut,
                         rows, capacity, hiddenCores, hiddenBaseTiles};
     RunPack<false>(args, AscendC::GetBlockIdx());
+#ifdef SGL_WELM_NAMED_LAUNCH
+    // RunPack already drains PIPE_ALL; retain auto_gen's other 950 teardown.
+    dsb(mem_dsb_t::DSB_ALL);
+    dci();
+#endif
 }
+
+#ifdef SGL_WELM_NAMED_LAUNCH
+static const struct FunLevelKType welm_pack_decode_inputs_kernel_section
+    __attribute__((used, section(".ascend.meta.welm_pack_decode_inputs_kernel"))) = {
+        {{F_TYPE_KTYPE, sizeof(unsigned int)}, K_TYPE_AIV}};
+#endif
 
 #ifdef SGL_WELM_PACK_SUPERKERNEL
 template <uint32_t split>

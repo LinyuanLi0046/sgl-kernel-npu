@@ -1,8 +1,14 @@
 // Copyright (c) 2026. Licensed under the BSD 3-Clause License.
 #include "acl/acl.h"
+#ifndef SGL_WELM_NAMED_LAUNCH
 #include "aclrtlaunch_welm_pack_decode_inputs_kernel.h"
+#endif
 #include "tiling/platform/platform_ascendc.h"
 #include "torch_helper.h"
+#ifdef SGL_WELM_NAMED_LAUNCH
+#include "welm_kernel_args.h"
+#include "welm_kernel_launch.h"
+#endif
 #include "../pack_config.h"
 
 #include <algorithm>
@@ -70,9 +76,17 @@ Outputs PackNpu(const at::Tensor &x, const at::Tensor &ids, const at::Tensor &we
                 "welm_pack_decode_inputs: insufficient UB for the device's AIV core count");
     // All tiling attributes are scalar launch arguments. No tiling tensor,
     // H2D copy, workspace memset, device query of input values, or collective.
+#ifdef SGL_WELM_NAMED_LAUNCH
+    const welm::PackArgs<void *> args{
+        x.data_ptr(), ids.data_ptr(), weights.data_ptr(),
+        std::get<0>(outputs).data_ptr(), std::get<1>(outputs).data_ptr(), std::get<2>(outputs).data_ptr(),
+        rows, cap, hiddenCores, hiddenBaseTiles};
+    welm::Launch(welm::Kernel::Pack, "welm_pack_decode_inputs_kernel", blockDim, args);
+#else
     EXEC_KERNEL_CMD(welm_pack_decode_inputs_kernel, blockDim,
                     x, ids, weights, std::get<0>(outputs), std::get<1>(outputs), std::get<2>(outputs),
                     rows, cap, hiddenCores, hiddenBaseTiles);
+#endif
     return outputs;
 }
 }  // namespace

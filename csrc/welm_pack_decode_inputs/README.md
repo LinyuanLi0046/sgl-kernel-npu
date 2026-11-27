@@ -65,10 +65,20 @@ each and one routing core. `N=4` copies eight hidden chunks and zeroes eight;
 
 Tiling uses scalar launch arguments only: there is no tiling H2D, workspace
 initialization, host/device synchronization, `.item()`, sorting or collective.
-The host uses the repository's `EXEC_KERNEL_CMD` queue-aware launch helper.
+The host retains the repository's `OpCommand` queue/current-stream behavior.
+On 950 with `SGL_WELM_PACK_SUPERKERNEL=ON`, it uses the shared named launcher;
+other builds retain `EXEC_KERNEL_CMD`.
 The Torch op has a Meta implementation for npugraph_ex/fullgraph tracing.
 
 ## Build
+
+The 950 SK-enabled target shares the
+[ordinary/SK entry fix and verification steps](../welm_sigmoid_mul/README.md#950-named-launch-fix-for-the-ordinarysk-entry-collision)
+with sigmoid-mul. Its raw `welm_pack_decode_inputs_kernel.o` is packaged beside
+the extension, checked for a correct SK_BIND, and launched by the ordinary
+global's name. Install the complete rebuilt wheel; do not copy only the `.so`.
+The optimized packing/VF body, capacity support, and production Triton dispatch
+path are unchanged by this launch fix.
 
 Use the existing kernel-wheel build, specifying the server's exact SoC accepted
 by the installed CANN:

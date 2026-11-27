@@ -1,18 +1,13 @@
 // Copyright (c) 2026. Licensed under the BSD 3-Clause License.
 #include "kernel_operator.h"
 #include "../sigmoid_mul_config.h"
+#include "../../utils/welm_kernel_args.h"
 
 namespace {
 using namespace AscendC;
 
-struct SigmoidMulArgs {
-    GM_ADDR gate;
-    GM_ADDR attention;
-    GM_ADDR output;
-    uint32_t rows;
-    uint32_t tileRows;
-    uint32_t activeCores;
-};
+using SigmoidMulArgs = sglang::npu_kernel::welm::SigmoidMulArgs<GM_ADDR>;
+static_assert(sizeof(SigmoidMulArgs) == 40 && offsetof(SigmoidMulArgs, activeCores) == 32);
 
 // All gate nonlinearities are computed once per tile, before broadcasting.
 // Intermediate sigmoid values stay in registers, including the BF16 rounding.
@@ -126,8 +121,8 @@ __aicore__ inline void RunSigmoidMul(const SigmoidMulArgs &args, uint32_t blockI
 }
 }  // namespace
 
-// Keep the ordinary entry compatible with ascendc_library's auto_gen wrapper.
-// Its AIV task type is independent of the separate __sk__ entry below.
+// In the SK-enabled 950 build this original global is both the named launch
+// target and the SK_BIND target. No auto_gen renaming/wrapper participates.
 extern "C" __global__ __aicore__ void welm_sigmoid_mul_kernel(
     GM_ADDR gate, GM_ADDR attention, GM_ADDR output,
     uint32_t rows, uint32_t tileRows, uint32_t activeCores)
@@ -135,7 +130,20 @@ extern "C" __global__ __aicore__ void welm_sigmoid_mul_kernel(
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     const SigmoidMulArgs args{gate, attention, output, rows, tileRows, activeCores};
     RunSigmoidMul<false>(args, GetBlockIdx());
+#ifdef SGL_WELM_NAMED_LAUNCH
+    // RunSigmoidMul already drains PIPE_ALL. Preserve the remaining ordinary
+    // 950 entry teardown previously supplied by auto_gen, outside the SK body.
+    dsb(mem_dsb_t::DSB_ALL);
+    dci();
+#endif
 }
+
+#ifdef SGL_WELM_NAMED_LAUNCH
+// Preserve the AIV metadata previously emitted by the legacy wrapper.
+static const struct FunLevelKType welm_sigmoid_mul_kernel_section
+    __attribute__((used, section(".ascend.meta.welm_sigmoid_mul_kernel"))) = {
+        {{F_TYPE_KTYPE, sizeof(unsigned int)}, K_TYPE_AIV}};
+#endif
 
 #ifdef SGL_WELM_SIGMOID_MUL_SUPERKERNEL
 template <uint32_t split>
