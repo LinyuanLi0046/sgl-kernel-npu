@@ -622,6 +622,7 @@ class Buffer:
         return_recv_hook: bool = False,
         topk_weights: Optional[torch.Tensor] = None,
         quant_mode: Optional[str] = None,
+        compile_adapter=None,
     ) -> Tuple[
         Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple, EventOverlap, Callable
     ]:
@@ -687,6 +688,10 @@ class Buffer:
             return_recv_hook=return_recv_hook,
             topk_weights=topk_weights,
             quant_mode=quant_mode,
+            **(
+                {"compile_adapter": compile_adapter}
+                if compile_adapter is not None else {}
+            ),
         )
 
     @log_parameters(["topk_idx"])
@@ -700,6 +705,7 @@ class Buffer:
         async_finish: bool = False,
         return_recv_hook: bool = False,
         out: Optional[torch.Tensor] = None,
+        compile_adapter=None,
     ) -> Tuple[torch.Tensor, EventOverlap, Callable]:
         """
         A low-latency implementation for combine.
@@ -736,6 +742,10 @@ class Buffer:
             async_finish=async_finish,
             return_recv_hook=return_recv_hook,
             out=out,
+            **(
+                {"compile_adapter": compile_adapter}
+                if compile_adapter is not None else {}
+            ),
         )
 
     def begin_profile(

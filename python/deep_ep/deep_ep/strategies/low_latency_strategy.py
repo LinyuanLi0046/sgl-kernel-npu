@@ -4,6 +4,7 @@ All low latency mode strategy implementations are in this file.
 """
 
 import os
+from functools import partial
 from typing import Callable, List, Optional, Tuple, Union
 
 import torch
@@ -203,6 +204,55 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
         self._fused_padding_enabled = os.getenv("DEEPEP_OPS_FUSED_PADDING", "0") == "1"
         self._active_mask_templates = {}
 
+    def get_welm_compile_callables(self, hidden_size, topk, dtype, capacity):
+        """Bind tensor-only calls; compilation state belongs to the caller's layer.
+
+        This does not change the process-shared strategy or its padding policy.
+        Resolve communication attributes and masks before FX tracing/capture.
+        """
+        if not self._use_950dt_mte:
+            raise ValueError("WeLM full MoE requires Ascend950DT ops MTE dispatch")
+        if (hidden_size, topk, dtype) != (2048, 10, torch.bfloat16):
+            raise ValueError("WeLM AscendC pack requires BF16 hidden=2048 and topk=10")
+        if not 0 < capacity <= 128:
+            raise ValueError("WeLM AscendC pack requires dispatch capacity <= 128")
+        shared_ranks = int(os.getenv("MOE_SHARED_EXPERT_RANK_NUM", 0))
+        counts_type = int(os.getenv("MOE_EXPERT_TOKEN_NUMS_TYPE", 1))
+        if shared_ranks != 0 or counts_type != 1:
+            raise ValueError(
+                "WeLM full MoE requires MOE_SHARED_EXPERT_RANK_NUM=0 and "
+                "MOE_EXPERT_TOKEN_NUMS_TYPE=1 (per-expert counts)"
+            )
+        import sgl_kernel_npu  # noqa: F401
+
+        if not hasattr(torch.ops.npu, "welm_pack_decode_inputs"):
+            raise RuntimeError("Install sgl-kernel-npu with welm_pack_decode_inputs")
+        group = dict(
+            group_ep=self.group_name,
+            ep_world_size=self.group_size,
+            ep_rank_id=self.rank,
+            shared_expert_rank_num=shared_ranks,
+        )
+        if not group["group_ep"] or group["ep_world_size"] <= 1:
+            raise ValueError(
+                "WeLM full MoE requires an initialized EP communication group"
+            )
+        self.prepare_low_latency_mask(capacity)
+        return dict(
+            pack=self._welm_pack_inputs,
+            dispatch=partial(
+                self._npu_low_latency_dispatch,
+                **group,
+                expert_token_nums_type=counts_type,
+                cast_counts_to_int64=True,
+            ),
+            combine=partial(self._npu_low_latency_combine, **group),
+        )
+
+    @staticmethod
+    def _welm_pack_inputs(x, topk_ids, topk_weights, capacity):
+        return torch.ops.npu.welm_pack_decode_inputs(x, topk_ids, topk_weights, capacity)
+
     def _can_fuse_padding(
         self,
         x,
@@ -278,6 +328,7 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
         return_recv_hook: bool = False,
         topk_weights: Optional[torch.Tensor] = None,
         quant_mode: Optional[str] = None,
+        compile_adapter=None,
     ) -> Tuple[
         Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor],
         torch.Tensor,
@@ -290,6 +341,22 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
         padding_size = num_max_dispatch_tokens_per_rank - x.size(0)
         if padding_size < 0:
             raise ValueError("Input rows exceed the ops low-latency dispatch capacity")
+        if compile_adapter is not None and (
+            num_max_dispatch_tokens_per_rank > 128
+            or not self._can_fuse_padding(
+                x,
+                topk_ids,
+                topk_weights,
+                num_max_dispatch_tokens_per_rank,
+                use_fp8,
+                use_ue8m0,
+                use_mxfp4,
+                quant_mode,
+            )
+        ):
+            raise ValueError(
+                "WeLM full MoE dispatch no longer satisfies its BF16 pack contract"
+            )
         if self.comm_alg == "hierarchy":
             assert (
                 topk_weights is not None
@@ -309,7 +376,13 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
             x_active_mask = template.narrow(
                 0, padding_size, num_max_dispatch_tokens_per_rank
             )
-            if self._fused_padding_enabled and self._can_fuse_padding(
+            if compile_adapter is not None:
+                # Layer-local compiled AscendC pack; never change the shared
+                # strategy's DEEPEP_OPS_FUSED_PADDING policy for other calls.
+                x_padding, topk_padding, weight_padding = compile_adapter.pack(
+                    x, topk_ids, topk_weights, num_max_dispatch_tokens_per_rank
+                )
+            elif self._fused_padding_enabled and self._can_fuse_padding(
                 x,
                 topk_ids,
                 topk_weights,
@@ -347,6 +420,11 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
                     )
                     weight_padding = torch.cat((topk_weights, weight_padding), dim=0)
 
+        dispatch = (
+            self._npu_low_latency_dispatch
+            if compile_adapter is None
+            else compile_adapter.dispatch
+        )
         (
             packed_recv_x,
             packed_recv_x_scales,
@@ -354,7 +432,7 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
             packed_recv_src_info,
             packed_recv_layout_range,
             expand_scales,
-        ) = self._npu_low_latency_dispatch(
+        ) = dispatch(
             x=x_padding,
             topk_idx=topk_padding,
             num_experts=num_experts,
@@ -400,6 +478,7 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
         async_finish: bool = False,
         return_recv_hook: bool = False,
         out: Optional[torch.Tensor] = None,
+        compile_adapter=None,
     ) -> Tuple[torch.Tensor, EventOverlap, Callable]:
 
         src_num = topk_idx.size(0)
@@ -429,7 +508,12 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
                 weight_padding.record_stream(
                     torch.npu.current_stream(weight_padding.device)
                 )
-        combined_x = self._npu_low_latency_combine(
+        combine = (
+            self._npu_low_latency_combine
+            if compile_adapter is None
+            else compile_adapter.combine
+        )
+        combined_x = combine(
             x=x,
             topk_idx=topk_padding,
             topk_weights=weight_padding,
@@ -460,12 +544,19 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
         topk_weights=None,
         expert_shard_type=0,
         shared_expert_num=0,
-        shared_expert_rank_num=0,
+        shared_expert_rank_num=None,
         num_max_dispatch_tokens_per_rank=0,
+        expert_token_nums_type=None,
+        group_ep=None,
+        ep_world_size=None,
+        ep_rank_id=None,
+        cast_counts_to_int64=False,
     ):
 
-        shared_expert_rank_num = int(os.getenv("MOE_SHARED_EXPERT_RANK_NUM", 0))
-        expert_token_nums_type = int(os.getenv("MOE_EXPERT_TOKEN_NUMS_TYPE", 1))
+        if shared_expert_rank_num is None:
+            shared_expert_rank_num = int(os.getenv("MOE_SHARED_EXPERT_RANK_NUM", 0))
+        if expert_token_nums_type is None:
+            expert_token_nums_type = int(os.getenv("MOE_EXPERT_TOKEN_NUMS_TYPE", 1))
         if comm_alg == "hierarchy":
             assert (
                 shared_expert_num == 0
@@ -482,9 +573,9 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
         ) = torch_npu.npu_moe_distribute_dispatch_v2(
             x=x,
             expert_ids=topk_idx,
-            group_ep=self.group_name,
-            ep_world_size=self.group_size,
-            ep_rank_id=self.rank,
+            group_ep=self.group_name if group_ep is None else group_ep,
+            ep_world_size=self.group_size if ep_world_size is None else ep_world_size,
+            ep_rank_id=self.rank if ep_rank_id is None else ep_rank_id,
             moe_expert_num=num_experts,
             scales=x_smooth_scale,
             x_active_mask=x_active_mask,
@@ -501,7 +592,8 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
         return (
             expand_x,
             dynamic_scales,
-            expert_token_nums,
+            expert_token_nums.to(torch.int64)
+            if cast_counts_to_int64 else expert_token_nums,
             expand_idx,
             ep_recv_counts,
             expand_scales,
@@ -523,11 +615,15 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
         shared_expert_x=None,
         expert_shared_type=0,
         shared_expert_num=0,
-        shared_expert_rank_num=0,
+        shared_expert_rank_num=None,
         num_max_dispatch_tokens_per_rank=0,
+        group_ep=None,
+        ep_world_size=None,
+        ep_rank_id=None,
     ):
 
-        shared_expert_rank_num = int(os.getenv("MOE_SHARED_EXPERT_RANK_NUM", 0))
+        if shared_expert_rank_num is None:
+            shared_expert_rank_num = int(os.getenv("MOE_SHARED_EXPERT_RANK_NUM", 0))
         if comm_alg == "hierarchy":
             assert (
                 shared_expert_num == 0
@@ -539,9 +635,9 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
             assist_info_for_combine=assist_info_for_combine,
             ep_send_counts=ep_send_counts,
             expert_scales=topk_weights,
-            group_ep=self.group_name,
-            ep_world_size=self.group_size,
-            ep_rank_id=self.rank,
+            group_ep=self.group_name if group_ep is None else group_ep,
+            ep_world_size=self.group_size if ep_world_size is None else ep_world_size,
+            ep_rank_id=self.rank if ep_rank_id is None else ep_rank_id,
             moe_expert_num=num_experts,
             tp_send_counts=None,
             x_active_mask=x_active_mask,
